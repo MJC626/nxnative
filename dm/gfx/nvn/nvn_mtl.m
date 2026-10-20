@@ -3049,8 +3049,16 @@ static int vconv_int(int f, int *bits, int *sgn) {   // components of an 8 / 16-
     for (int i = 0; i < 16; i++) if (T[i] == f) { *bits = i & 2 ? 16 : 8; *sgn = i & 1; return i / 4 + 1; }
     return 0;
 }
+// *_UI2F / *_I2F formats (0x51-0x68, R8 R16 R32 RG8 … RGBA32, unsigned then signed): integers that the fetch converts to float without normalizing (200 → 200.0). Metal has no such vertex
+// format and refuses an integer format into a float input, so they are converted here too; an integer input of the same format takes the float32 bits, as from Maxwell's fetch.
+// Breath of the Wild: an RG8_UI2F attribute (0x57, at the title) had no Metal format and read 0
+static int vconv_i2f(int f, int *bits, int *sgn) {   // components of an integer-read-as-float format (with its component size and signedness); 0 = not one
+    if (f < 0x51 || f > 0x68) return 0;
+    int i = (f - 0x51) >> 1; *sgn = (f - 0x51) & 1; *bits = 8 << (i % 3); return i / 3 + 1;
+}
 static int vconv_size(int f) {   // bytes of one element
     int ib, is, in = vconv_int(f, &ib, &is); if (in) return in * ib / 8;
+    if ((in = vconv_i2f(f, &ib, &is))) return in * ib / 8;
     switch (f) { case 0x01: case 0x02: return 1; case 0x05: case 0x06: case 0x07: case 0x0D: case 0x0E: return 2; case 0x19: case 0x1A: return 3;
                  case 0x1D: case 0x1E: case 0x1F: return 6; case 0x29: case 0x2A: case 0x2B: return 8; }
     return 4;
@@ -3070,6 +3078,12 @@ static void vconv_elem(int f, const uint8_t *p, float o[4]) {
             else { uint16_t h; memcpy(&h, p + 2 * i, 2); u[i] = is ? (uint32_t)(int32_t)(int16_t)h : h; } }
         memcpy(o, u, sizeof u); return; }
     o[0] = o[1] = o[2] = 0; o[3] = 1;
+    if ((in = vconv_i2f(f, &ib, &is))) {   // integers read as floats: each value as a float, the missing components (0, 0, 0, 1.0)
+        for (int i = 0; i < in; i++) {
+            if (ib == 8) o[i] = is ? (float)(int8_t)p[i] : (float)p[i];
+            else if (ib == 16) { uint16_t h; memcpy(&h, p + 2 * i, 2); o[i] = is ? (float)(int16_t)h : (float)h; }
+            else { uint32_t w; memcpy(&w, p + 4 * i, 4); o[i] = is ? (float)(int32_t)w : (float)w; } }
+        return; }
     int n = vconv_ncomp(f);
     for (int i = 0; i < n; i++) switch (f) {
         case 0x01: case 0x0D: case 0x19: case 0x25: o[i] = p[i] / 255.0f; break;
@@ -3093,6 +3107,7 @@ static int vconv_wanted(const nvn_refl *rf, int v, const pso_key *k) {   // does
     int a = rf->v[v].nvn, ct = rf->v[v].ct, ib, is;
     if (a >= 16) return 0;
     int f = k ? k->attr[a].fmt : S.attr[a].fmt;
+    if (vconv_i2f(f, &ib, &is)) return 1;   // whatever the input type
     if (ct == NVN_CT_FLOAT) return vconv_int(f, &ib, &is) > 0;
     if (ct != NVN_CT_UINT && ct != NVN_CT_INT) return 0;
     return vconv_ncomp(f) || (vconv_int(f, &ib, &is) && is != (ct == NVN_CT_INT));
@@ -3113,7 +3128,9 @@ static void vconv_bind(id<MTL4RenderCommandEncoder> en, const nvn_refl *rf) {
                 for (uint64_t i = 0; i < nv; i++) vconv_elem(f, (const uint8_t *)(uintptr_t)(addr + off + i * stride), d + 4 * i);
                 gpu = b.gpuAddress + o;
                 int c = g_vconv_next++ % 64; g_vconv[c].addr = addr; g_vconv[c].size = size; g_vconv[c].serial = g_sub_serial; g_vconv[c].fmt = (uint32_t)f; g_vconv[c].off = off; g_vconv[c].stride = stride; g_vconv[c].gpu = gpu;
-                if (rf->v[v].ct == NVN_CT_FLOAT) RED_ONCE(99, "vertex attribute format %#x (8 / 16-bit integer) feeds a float input: the 32-bit register values Maxwell's fetch makes are bound as float bit patterns, converted on the CPU at replay", f);
+                int ib, is;
+                if (vconv_i2f(f, &ib, &is)) { static int once; if (!once++) MLOG("vertex attribute format %#x (integers read as floats, which Metal has no vertex format for): converted on the CPU at replay and bound separately", f); }
+                else if (rf->v[v].ct == NVN_CT_FLOAT) RED_ONCE(99, "vertex attribute format %#x (8 / 16-bit integer) feeds a float input: the 32-bit register values Maxwell's fetch makes are bound as float bit patterns, converted on the CPU at replay", f);
                 else if (vconv_ncomp(f)) RED_ONCE(89, "vertex attribute format %#x feeds an integer input: converted to float32 bit patterns on the CPU at replay and bound separately (the conversion Maxwell does on vertex fetch)", f);
                 else RED_ONCE(96, "vertex attribute format %#x (8 / 16-bit integer) feeds an integer input of the opposite signedness: extended to 32 bits with the format's own signedness on the CPU at replay and bound separately", f);
             } else if (nv) RED_ONCE(90, "vertex attribute conversion: a range of %llu vertices exceeds the per-frame staging (format %#x)", (unsigned long long)nv, f);
@@ -3137,6 +3154,12 @@ static MTLVertexFormat vfmt(int f) {
         case 0x29: return MTLVertexFormatHalf4; case 0x2A: return MTLVertexFormatUShort4Normalized; case 0x2B: return MTLVertexFormatShort4Normalized; case 0x2C: return MTLVertexFormatUShort4;
         case 0x2D: return MTLVertexFormatShort4; case 0x2E: return MTLVertexFormatFloat4; case 0x2F: return MTLVertexFormatUInt4; case 0x30: return MTLVertexFormatInt4;
         case 0x3D: return MTLVertexFormatUInt1010102Normalized; case 0x69: return MTLVertexFormatInt1010102Normalized; case 0x3F: return MTLVertexFormatFloatRG11B10; case 0x9A: return MTLVertexFormatUChar4Normalized_BGRA;
+    }
+    int ib, is, in = vconv_i2f(f, &ib, &is);   // integers read as floats: the integer format of the same layout (the pipeline reads vconv_bind's conversion)
+    if (in) {
+        static const MTLVertexFormat U[3][4] = { { MTLVertexFormatUChar, MTLVertexFormatUChar2, MTLVertexFormatUChar3, MTLVertexFormatUChar4 }, { MTLVertexFormatUShort, MTLVertexFormatUShort2, MTLVertexFormatUShort3, MTLVertexFormatUShort4 }, { MTLVertexFormatUInt, MTLVertexFormatUInt2, MTLVertexFormatUInt3, MTLVertexFormatUInt4 } };
+        static const MTLVertexFormat I[3][4] = { { MTLVertexFormatChar, MTLVertexFormatChar2, MTLVertexFormatChar3, MTLVertexFormatChar4 }, { MTLVertexFormatShort, MTLVertexFormatShort2, MTLVertexFormatShort3, MTLVertexFormatShort4 }, { MTLVertexFormatInt, MTLVertexFormatInt2, MTLVertexFormatInt3, MTLVertexFormatInt4 } };
+        return (is ? I : U)[ib == 8 ? 0 : ib == 16 ? 1 : 2][in - 1];
     }
     return MTLVertexFormatInvalid;
 }
