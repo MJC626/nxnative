@@ -33,7 +33,7 @@ All of these are tested on an iPhone and playable:
 | The&nbsp;Legend&nbsp;of&nbsp;Zelda:&nbsp;Link's&nbsp;Awakening | ~6&nbsp;GB | |
 | Super&nbsp;Mario&nbsp;Odyssey | ~6&nbsp;GB | |
 | Hades | ~4&nbsp;GB | |
-| Hyrule&nbsp;Warriors:&nbsp;Age&nbsp;of&nbsp;Calamity | ~15&nbsp;GB | |
+| Hyrule&nbsp;Warriors:&nbsp;Age&nbsp;of&nbsp;Calamity | ~15&nbsp;GB | Upgraded to 60 fps (30 fps on Switch) |
 | Fire&nbsp;Emblem:&nbsp;Three&nbsp;Houses | ~13&nbsp;GB | Upgraded to 60 fps (30 fps on Switch) |
 | Super&nbsp;Mario&nbsp;Galaxy | ~3&nbsp;GB | |
 | The&nbsp;Legend&nbsp;of&nbsp;Zelda:&nbsp;Tears&nbsp;of&nbsp;the&nbsp;Kingdom | ~17&nbsp;GB | Upgraded to 60 fps (30 fps on Switch) |

@@ -219,6 +219,14 @@ CUTS = {
   'c3cf52bf2b05d7310884971b50bcccb8': [
     (0x8d9610, '081ea0d2', '0826a0d2', 'sound engine heap: mov x8,#0xf00000 → mov x8,#0x1300000 (+4 MB)'),
     (0x8d9618, '091ca152', '0914a152', 'sound data heap: mov w9,#0x8e00000 → mov w9,#0x8a00000 (-4 MB; the block the three heaps come from keeps its total size)'),
+    # 60 fps. nnMain builds KTGL's device config on its stack and inits the device once (main+0x8d94c4 → main+0x17c34f0): {1920, 1080, 3, 9, 5, interval 2, 9, …}. The device
+    # keeps the interval (main+0x17c4ba8 → device +0x2aa4, passed to every present at main+0x17ced78, which sets it on the window when it changes) and its frame rate,
+    # 59.94 / interval (main+0x17c37c8 → device +0x32d0), which the game steps its time by (the event scripts at main+0x7802c4: timescale / frame rate). Forcing interval 1 at the
+    # present alone would keep the 1/29.97 step at 60 frames a second. With interval 1 in the config the device runs the engine's own 60 fps mode: frame rate 59.94, interval 1
+    (0x8d94b0, '4900c0f2', '2900c0f2', 'KTGL device config present interval: movk x9,#0x2,lsl #32 → #0x1 (60 fps; the device frame rate becomes 59.94 / 1)', 'host-only'),
+    # The frame itself is paced by a KIDS task (main+0x166d9c0, on a KIDSTaskScheduler thread): it waits until 1 / fps has passed since the last frame (tick frequency / fps,
+    # SleepThread and a poll), then steps the game by the time that really passed (+0x24, seconds). fps (+0x30) is 30, from engine data (main+0x166daa4)
+    (0x166db80, '14159f1a', '94078052', 'KIDS frame task wait: csinc w20,w8,wzr,ne (fps, at least 1) → mov w20,#60 (wait 1/60 s; the step stays the measured time)', 'host-only'),
   ],
 }
 # ---- Registered observation gates: {NSO build ID: [(offset, number, original instruction word, reason)]}. Numbers match OBS_* in the host's hle.h;
