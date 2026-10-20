@@ -49,6 +49,25 @@ HLE_FORCE("_ZN2nn4time19StandardSteadyClock19GetCurrentTimePointEPNS0_20SteadyCl
 HLE_FORCE("_ZN2nn4time23StandardUserSystemClock14GetCurrentTimeEPNS0_9PosixTimeE", "user clock → host time()", Result, h_time_GetCurrentTime, int64_t *out) {
     int64_t ft = fixed_time(); *out = ft >= 0 ? ft : time(NULL); return RES_OK;
 }
+// User clock context (0x20 bytes: s64 offset + the steady time point it was made at; user time = offset + a steady time point of the same source ID, the snapshot below fills its +0x00 the same way).
+// The SDK reads it from the time service's shared memory, which the host never opens: it returns 0x74 and writes nothing. Unity's DateTime.UtcNow (Engage main+0x4ad40c; Ace Attorney Investigations
+// 1&2 per PR #14) then never starts its clock and reads 0001-01-01. Unity takes its time from GetCurrentTime plus system ticks and only compares the context to notice the clock being set, so like a
+// Switch's it stays the same until the host clock moves against the guest ticks by more than a second (clock set by hand, a sleep mach_absolute_time did not count); with DM_FIXED_TIME it is made once
+HLE_FORCE("_ZN2nn4time23StandardUserSystemClock21GetSystemClockContextEPNS0_18SystemClockContextE", "user clock context from the time service; the host's user clock over its steady clock, renewed when the host clock is set",
+          Result, h_time_GetContext, uint8_t *out) {
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static uint8_t ctx[0x20]; static int64_t drift; static int made;
+    uint8_t tp[0x18]; int64_t now; h_time_SteadyNow(tp); h_time_GetCurrentTime(&now);
+    int64_t d = now - (int64_t)(guest_ns() / 1000000000ull);
+    pthread_mutex_lock(&mu);
+    if (!made || (fixed_time() < 0 && llabs(d - drift) > 1)) {
+        int64_t off = now - *(const int64_t *)tp; memcpy(ctx, &off, 8); memcpy(ctx + 8, tp, 0x18);
+        if (made) LOG("time: host clock moved %+lld s against the guest ticks, new user clock context", (long long)(d - drift));
+        drift = d; made = 1;
+    }
+    memcpy(out, ctx, 0x20);
+    pthread_mutex_unlock(&mu);
+    return RES_OK;
+}
 // Forced Terror Zone for stages 6–10 of the boss rush (set by dm_bossrush.c): when g_dm_tz_time is non-zero and not expired, only the clock reads at the "Terror Zone" sites get it; save timestamps and all other calls are unchanged.
 // Which sites: the return point falls in the cluster starting at the zone function 0x58f1e0 (0x58f1e0–0x591440), or the zone schedule 0x58f310 is called within 8 instructions after the return (server side 0x636b38 applying the zone, 0x694b48 and so on, 9 sites).
 // Expiry: dm_bossrush renews it by 1 second every tick; once this run stops ticking (exit / crash) it no longer applies, and the next run gets the real clock when the game is created.
