@@ -1084,6 +1084,7 @@ def parse_args(argv):
     ap.add_argument('--profile-out', help='where the provisional profile goes (default: <NSP folder>/<title ID>_build/profile)')
     ap.add_argument('--provisional', action='store_true', help='build from a provisional profile even when dm/games has one for the game (tests the guesses)')
     ap.add_argument('--no-heap-check', action='store_true', help='a provisional profile: skip the heap check on the Mac (the alias / heap split stays a guess)')
+    ap.add_argument('--no-romfs', action='store_true', help='do not embed the RomFS into the IPA (the game files must be placed in Documents/romfs on the device; yields an IPA of tens of MB)')
     ap.add_argument('--progress', choices=('auto', 'bar', 'lines', 'off'), help='stage lines on the console: bar = one line per stage, redrawn in place; lines = a plain line every BEAT seconds; off = only each stage\'s start and end '
                     '(default: the PROGRESS setting; auto = bar in a terminal or Spyder, lines when the output goes to a file or a pipe)')
     return ap.parse_args(argv)
@@ -1192,7 +1193,19 @@ def main(args=None):
 
     if free_gb(out_ipa.parent) < 5: raise BuildError(f'less than 5 GB free on the volume of {out_ipa.parent}')
     say(f'building the IPA → {out_ipa}')
-    ipa_env = dict(env, GAME=g.id, W=str(work / 'ipa'), PATCHED=str(patched), ROMFS=str(game / 'RomFS'), MSL_IOS=str(ios), FONT_PY=py, DM_DISPLAY_NAME=app_name, DM_BUNDLE_ID=bundle_id, AOC=str(aoc or ''))
+    if args.no_romfs:
+        dummy_romfs = work / 'dummy_romfs'
+        dummy_romfs.mkdir(parents=True, exist_ok=True)
+        marker = g.get('romfs_marker')
+        if marker:
+            mf = dummy_romfs / marker
+            mf.parent.mkdir(parents=True, exist_ok=True)
+            mf.touch()
+        romfs_path = dummy_romfs
+        say('packing a slim IPA without RomFS (game assets must be placed in Documents/romfs on the device)')
+    else:
+        romfs_path = game / 'RomFS'
+    ipa_env = dict(env, GAME=g.id, W=str(work / 'ipa'), PATCHED=str(patched), ROMFS=str(romfs_path), MSL_IOS=str(ios), FONT_PY=py, DM_DISPLAY_NAME=app_name, DM_BUNDLE_ID=bundle_id, AOC=str(aoc or ''))
     if app_version: ipa_env['DM_APP_VERSION'] = app_version
     # app icon: the game icon nx_extract saved from the control data (English, icon.jpg); the packed version's first, then the base game's
     icon = next((d / 'icon.jpg' for d in (game, base) if (d / 'icon.jpg').exists()), None)
