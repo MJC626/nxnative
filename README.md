@@ -40,7 +40,7 @@ All of these are tested on an iPhone and playable:
 
 Being ported:
 
-- Monster Hunter Rise (base game + update 16.0.2): runs on an iPhone at 30 fps from character creation into the opening in Kamura village.
+- Monster Hunter Rise (base game + update 16.0.2): runs on an iPhone at 60 fps (30 fps on Switch) from character creation into the opening in Kamura village.
 
 | | |
 |:---:|:---:|
