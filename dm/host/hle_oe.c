@@ -242,8 +242,9 @@ static void scale3d_tick(void) {
         if (e) { char *end; float v = strtof(e, &end); if (end == e || *end || !(v >= 0.5f && v <= 1.0f)) die("DM_3D_SCALE invalid: %s (must be 0.5–1.0)", e); want_cfg = v; }
         for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) main = &g_mod[i];
         // The addresses above (renderer global pointer, resolution change function, member offsets) all belong to D2R build db0507f3…; in other builds (every Mario version) the same addresses are unrelated data and code
-        // (Mario v0's main+0x8582f0 is in the middle of a static initializer), so writing and calling them would corrupt memory. Only enabled on that build
-        if (main && strcmp(main->build_id, "db0507f36b84200ac05f75d76ed5026f")) { LOG("3D render scale: main build %s has no known addresses, left alone (only D2R db0507f3… is known)", main->build_id[0] ? main->build_id : "(output has no build ID)"); main = NULL; }
+        // (Mario v0's main+0x8582f0 is in the middle of a static initializer), so writing and calling them would corrupt memory. Only enabled on that build; elsewhere it says so only when DM_3D_SCALE asks for this scale
+        // (Breath of the Wild and Tears of the Kingdom scale through DM_RENDER_SCALE, and the line read like a failure in their logs)
+        if (main && strcmp(main->build_id, "db0507f36b84200ac05f75d76ed5026f")) { if (e) LOG("3D render scale: main build %s has no known addresses, left alone (only D2R db0507f3… is known)", main->build_id[0] ? main->build_id : "(output has no build ID)"); main = NULL; }
     }
     int lv = atomic_load(&g_scale3d_level);   // dynamic level: 0 = configured value, 1 = 0.72, 2 = 0.70 (none higher than the configured value)
     float dyn = lv == 0 ? want_cfg : lv == 1 ? SCALE3D_MID : SCALE3D_MIN; if (dyn > want_cfg) dyn = want_cfg;
