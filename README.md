@@ -37,10 +37,7 @@ All of these are tested on an iPhone and playable:
 | Fire&nbsp;Emblem:&nbsp;Three&nbsp;Houses | ~13&nbsp;GB | Upgraded to 60 fps (30 fps on Switch) |
 | Super&nbsp;Mario&nbsp;Galaxy | ~3&nbsp;GB | |
 | The&nbsp;Legend&nbsp;of&nbsp;Zelda:&nbsp;Tears&nbsp;of&nbsp;the&nbsp;Kingdom | ~17&nbsp;GB | Upgraded to 60 fps (30 fps on Switch) |
-
-Being ported:
-
-- Monster Hunter Rise (base game + update 16.0.2): runs on an iPhone at 60 fps (30 fps on Switch) from character creation into the opening in Kamura village.
+| Monster&nbsp;Hunter&nbsp;Rise | ~22&nbsp;GB | Upgraded to 60 fps (30 fps on Switch) |
 
 | | |
 |:---:|:---:|
