@@ -51,6 +51,23 @@ else:
 # Networking cuts (excluded scope: Battle.net / online play): taken from a community offline fix (LFS Mod Offline Fix for v2228224, which differs from the official 94012 main in only these 7 words).
 # Measured: the system service layer (nifm offline / DNS black hole / account service) cannot get around it: the game itself sends Battle.net requests directly and allows offline play according to the "last online" time.
 CUTS = {
+  # Xenoblade Chronicles 3 1.0.0 (v0) sdk: AddressRegionManager node area 0x3fe00000 (about 1 GB) → 0x3e00000 (62 MB)
+  'e8cdceb1e77a8465fe20f21928e8d296': [
+    (0x346430, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000', 'host-only'),
+    (0x3464cc, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000', 'host-only'),
+  ],
+  # Xenoblade Chronicles 3 1.0.0 (v0) main: virtual address region reservation 60 GB (0xf00000000) → 3.0 GB (0xc0000000),
+  # and internal dynamic allocation arena 4 GB (0x100020000) → 2 GB (0x80020000).
+  # iOS caps guest address space to 5 GB (alias region 4.375 GB); the 60 GB allocation fails, and the 4 GB arena exceeds available space.
+  '60887a25b66529910275a1066003a002': [
+    (0xfa188c, 'e001c0d2', '0000b8d2', 'virtual address region size: mov x0,#0xf00000000 (60 GB) → mov x0,#0xc0000000 (3.0 GB)', 'host-only'),
+    (0xf55010, 'e98340b2', 'e9ff9fd2', 'arena alloc check: mov x9,#0x1ffffffff → movz x9,#0xffff', 'host-only'),
+    (0xf55020, '4900a0f2', '4900b0f2', 'arena alloc check: movk x9,#2,lsl #16 → movk x9,#0x8002,lsl #16', 'host-only'),
+    (0xf55078, 'e97b5fb2', '2900b092', 'arena base adjust: mov x9,#-0x200000000 → movn x9,#0x8001,lsl #16', 'host-only'),
+    (0xf5507c, 'c9ffbff2', '090080f2', 'arena base adjust: movk x9,#0xfffe,lsl #16 → movk x9,#0,lsl #0', 'host-only'),
+    (0xf55084, '4800a0d2', '4800b0d2', 'arena capacity: mov x8,#0x20000 → movz x8,#0x8002,lsl #16', 'host-only'),
+    (0xf55088, '2800c0f2', '1f2003d5', 'arena capacity: movk x8,#1,lsl #32 → nop', 'host-only'),
+  ],
   # Super Mario Bros. Wonder v0 main
   'cd6e42aee7934f4d8393cd43893ae25e': [
     # Resource heap slack: each resource unit's ExpHeap is created with the resource size table value + 0x1008 (main+0x1e603c → ExpHeap::create main+0x4aac38); the table holds Nintendo's measured peaks with almost no margin
