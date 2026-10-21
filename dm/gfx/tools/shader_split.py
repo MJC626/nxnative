@@ -111,6 +111,42 @@ def mshd_shaders(d, label):
     if len(out) % 2: red(f'{label} MSHD: {len(out)} stages, not in pairs')
     return out
 
+def nvsd_shaders(d, label):
+    """Monolith Soft NVSD containers (Xenoblade Chronicles 3: embedded in main).
+    A sequence of NVSD headers (magic 'NVSD', version 0x2711), each defining a vertex/pixel pair,
+    followed by the control sections and code areas.
+    """
+    out, nvsd_pos, p = [], [], 0
+    while True:
+        p = d.find(b'NVSD', p)
+        if p < 0: break
+        if len(d) - p >= 8 and struct.unpack_from('<I', d, p + 4)[0] == 0x2711:
+            nvsd_pos.append(p)
+        p += 4
+    if not nvsd_pos: return out
+    c_pos = d.find(CTL_MAGIC, nvsd_pos[-1])
+    g_pos = d.find(GFX_MAGIC, c_pos)
+    if c_pos < 0 or g_pos < 0: return out
+    cur_c, cur_g = c_pos, g_pos
+    for i, pos in enumerate(nvsd_pos):
+        v_code_len = struct.unpack_from('<I', d, pos + 0x10)[0]
+        v_ctl_len  = struct.unpack_from('<I', d, pos + 0x18)[0]
+        p_code_len = struct.unpack_from('<I', d, pos + 0x24)[0]
+        p_ctl_len  = struct.unpack_from('<I', d, pos + 0x2c)[0]
+        v_ctl, v_code = d[cur_c : cur_c + v_ctl_len], d[cur_g : cur_g + v_code_len]
+        why_v = check(label, 'vs', v_ctl, v_code)
+        if why_v: red(f'{label} NVSD {i} vs: {why_v}')
+        out.append((f'{label}#NVSD#var{i}', 'vs', v_ctl, v_code))
+        cur_c = (cur_c + v_ctl_len + 7) & ~7
+        cur_g += v_code_len
+        p_ctl, p_code = d[cur_c : cur_c + p_ctl_len], d[cur_g : cur_g + p_code_len]
+        why_p = check(label, 'ps', p_ctl, p_code)
+        if why_p: red(f'{label} NVSD {i} ps: {why_p}')
+        out.append((f'{label}#NVSD#var{i}', 'ps', p_ctl, p_code))
+        cur_c = (cur_c + p_ctl_len + 7) & ~7
+        cur_g += p_code_len
+    return out
+
 def glslc_shaders(d, label, need=True):
     """GLSLC compiler outputs (838 in 13 Sentinels' main read-only segment, one stage each): from the magic 0x19866891, +0x44 = the whole output's length; each output holds exactly one control section with the code area right after it (control +0x20 = control length).
     The magic is only 4 bytes and other games' mains have it too (Fire Emblem Engage has 11), so this runs only when the profile's shader_main_glslc is on, and keeps only outputs that pass the triple check.
@@ -398,6 +434,7 @@ def scan_blob(d, label, out):
         return
     if d[:4] == b'BAHS': out.extend(bahs_shaders(d, label)); return
     if d[:4] == b'MSHD': out.extend(mshd_shaders(d, label)); return
+    if b'NVSD' in d: out.extend(nvsd_shaders(d, label))
     for m in re.finditer(b'BNSH\0\0\0\0', d):
         size = struct.unpack_from('<I', d, m.start() + 0x1c)[0]
         if m.start() + size <= len(d) and d[m.start() + 0x60:m.start() + 0x64] == b'grsc': out.extend(bnsh_shaders(d, m.start(), label))
@@ -433,6 +470,7 @@ def var_pairs(found):
 def scan_file(args):
     """→ (relative path, {key: …}, pairs, extra); extra = this file's Unity type trees, or 'defer' (no type tree, scanned again in the second pass)"""
     path, rel = args[:2]
+    if path.endswith(('.ard', '.webm', '.pck', '.mp4', '.bk2', '.mp3', '.wav', '.ogg')): return rel, {}, set(), {}
     with open(path, 'rb') as f: head = f.read(16)
     found = []; trees = {}
     if head[:8] == IDRK:
@@ -549,7 +587,7 @@ def main():
         with open(os.path.join(pkg, name), 'wb') as f: f.write(b''.join(rr))
     with open(mapout, 'w') as f:
         kinds = ' / '.join(k for k, hit in (('BNSH / BAHS', any('#BNSH@' in r[4] or '#BAHS@' in r[4] for r in rows)), ('Unity Shader', any('#var' in r[4] and '#BNSH@' not in r[4] and '#MSHD#' not in r[4] and '#SDF#' not in r[4] for r in rows)),
-                                            ('MSHD', any('#MSHD#' in r[4] for r in rows)), ('GLSLC', any('#GLSLC@' in r[4] for r in rows)), ('RE Engine SDF', any('#SDF#' in r[4] for r in rows))) if hit)
+                                            ('MSHD', any('#MSHD#' in r[4] for r in rows)), ('GLSLC', any('#GLSLC@' in r[4] for r in rows)), ('NVSD', any('#NVSD#' in r[4] for r in rows)), ('RE Engine SDF', any('#SDF#' in r[4] for r in rows))) if hit)
         f.write(f'# kind: evidence  {NOTE} ({kinds} in RomFS + main) → control section + code area keys (dm/gfx/tools/shader_split.py)\n')
         f.write('# column 5 records where each key first appears; this game has no PC version to pair with\n')
         f.write('package\tindex\tstage\tdm_ctl_sha16\tsource\n')
