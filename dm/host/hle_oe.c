@@ -94,6 +94,9 @@ HLE_FORCE("_ZN2nn2oe23GetPreviousProgramIndexEv", "previous program index: launc
 HLE_FORCE("_ZN2nn2oe16DisableRecordingEv", "video recording switch; the host has no system recording", void, h_oe_DisableRec, void) {}
 HLE_FORCE("_ZN2nn2oe16EnableScreenShotEv", "screenshot switch; the host has no system screenshot", void, h_oe_EnableShot, void) {}
 HLE_FORCE("_ZN2nn2oe17DisableScreenShotEv", "screenshot switch; the host has no system screenshot", void, h_oe_DisableShot, void) {}
+HLE_FORCE("_ZN2nn2oe33EnableAlbumImageTakenNotificationEv", "album notification switch; the host has no system album", void, h_oe_EnableAlbumNotif, void) {}
+HLE_FORCE("_ZN2nn2oe34DisableAlbumImageTakenNotificationEv", "album notification switch; the host has no system album", void, h_oe_DisableAlbumNotif, void) {}
+HLE_FORCE("_ZN2nn2oe43GetUserInactivityDetectionTimeExtensionModeEv", "user inactivity detection mode: default", int, h_oe_InactivityMode, void) { return 0; }
 // Super Mario Odyssey: HOME button blocking around its own menus, screenshot orientation, and the auto-sleep query (all through am)
 HLE_FORCE("_ZN2nn2oe23BeginBlockingHomeButtonEv", "temporarily block the HOME button (through am); the host has no HOME button", void, h_oe_BlockHome, void) {}
 HLE_FORCE("_ZN2nn2oe21EndBlockingHomeButtonEv", "restore the HOME button (through am)", void, h_oe_UnblockHome, void) {}

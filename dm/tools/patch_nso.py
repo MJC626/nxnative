@@ -57,8 +57,10 @@ CUTS = {
     (0x3464cc, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000', 'host-only'),
   ],
   # Xenoblade Chronicles 3 1.0.0 (v0) main: virtual address region reservation 60 GB (0xf00000000) → 3.0 GB (0xc0000000),
-  # and internal dynamic allocation arena 4 GB (0x100020000) → 2 GB (0x80020000).
-  # iOS caps guest address space to 5 GB (alias region 4.375 GB); the 60 GB allocation fails, and the 4 GB arena exceeds available space.
+  # internal dynamic allocation arena 4 GB (0x100020000) → 2 GB (0x80020000),
+  # and physical RAM probe bypass (original probes memory by allocating 1 MB pages in a loop until failure; on host SVC 0x2C never fails,
+  # leaving all 3 GB mapped and held in memory, causing subsequent NVN memory pools to fail). Bypass directly sets available RAM to 2.5 GB.
+  # iOS caps guest address space to 5 GB (alias region 4.375 GB).
   '60887a25b66529910275a1066003a002': [
     (0xfa188c, 'e001c0d2', '0000b8d2', 'virtual address region size: mov x0,#0xf00000000 (60 GB) → mov x0,#0xc0000000 (3.0 GB)', 'host-only'),
     (0xf55010, 'e98340b2', 'e9ff9fd2', 'arena alloc check: mov x9,#0x1ffffffff → movz x9,#0xffff', 'host-only'),
@@ -67,6 +69,28 @@ CUTS = {
     (0xf5507c, 'c9ffbff2', '090080f2', 'arena base adjust: movk x9,#0xfffe,lsl #16 → movk x9,#0,lsl #0', 'host-only'),
     (0xf55084, '4800a0d2', '4800b0d2', 'arena capacity: mov x8,#0x20000 → movz x8,#0x8002,lsl #16', 'host-only'),
     (0xf55088, '2800c0f2', '1f2003d5', 'arena capacity: movk x8,#1,lsl #32 → nop', 'host-only'),
+    (0xf56c94, 'a80240f9', '0800b4d2', 'RAM probe bypass: mov x8,#0xa0000000 (2.5 GB pool)', 'host-only'),
+    (0xf56c98, 'e8feffb5', 'a80200f9', 'RAM probe bypass: str x8,[x21]', 'host-only'),
+    (0xf56c9c, '940240f9', 'c94100f0', 'RAM probe bypass: adrp x9,0x1791000', 'host-only'),
+    (0xf56ca0, 'f6031faa', '29dd45f9', 'RAM probe bypass: ldr x9,[x9,#0xbb8]', 'host-only'),
+    (0xf56ca4, '8002168b', '280100f9', 'RAM probe bypass: str x8,[x9]', 'host-only'),
+    (0xf56ca8, '0102a052', '20008052', 'RAM probe bypass: mov w0,#1', 'host-only'),
+    (0xf56cac, '15470194', 'f2ffff17', 'RAM probe bypass: b 0xf56c74', 'host-only'),
+    (0xd942a0, '09108052', 'e80000b4', 'null check on singleton: cbz x8, 0xd942bc', 'host-only'),
+    (0xd942a4, '09550039', '1f7101f8', 'null check on singleton: stur xzr, [x8, #0x17]', 'host-only'),
+    (0xd942a8, '01590039', '09108052', 'null check on singleton: mov w9, #0x80', 'host-only'),
+    (0xd942ac, '1f5d0039', '09550039', 'null check on singleton: strb w9, [x8, #0x15]', 'host-only'),
+    (0xd942b0, '01610039', '01590039', 'null check on singleton: strb w1, [x8, #0x16]', 'host-only'),
+    (0xd942b4, '1f9101b8', '01610039', 'null check on singleton: strb w1, [x8, #0x18]', 'host-only'),
+    (0xd942b8, '1fd10178', '1f2003d5', 'null check on singleton: nop', 'host-only'),
+    (0xf9bad0, 'e10300aa', 'c80200b4', 'allocator free: mov x1,x0 → cbz x8,0xf9bb28', 'host-only'),
+    (0xf9bad4, 'a80200b4', '7f0208eb', 'allocator free: cbz x8,0xf9bb28 → cmp x19,x8', 'host-only'),
+    (0xf9bad8, '68825ff8', '89020054', 'allocator free: ldur x8,[x19,#-8] → b.ls 0xf9bb28', 'host-only'),
+    (0xf9badc, '09054092', '0f000014', 'allocator free: and x9,x8,#3 → b 0xf9bb18', 'host-only'),
+    (0xb7fcf8, 'a02300d1', '611300b4', 'tutorial container null check: sub x0,x29,#8 → cbz x1,0xb7ff64', 'host-only'),
+    (0xb7fcfc, '78890694', 'a1831ff8', 'tutorial container null check: bl 0xd222dc → stur x1,[x29,#-8]', 'host-only'),
+    (0xb7fe90, 'a02300d1', '410300b4', 'tutorial container null check: sub x0,x29,#8 → cbz x1,0xb7fef8', 'host-only'),
+    (0xb7fe94, '12890694', 'a1831ff8', 'tutorial container null check: bl 0xd222dc → stur x1,[x29,#-8]', 'host-only'),
   ],
   # Super Mario Bros. Wonder v0 main
   'cd6e42aee7934f4d8393cd43893ae25e': [
