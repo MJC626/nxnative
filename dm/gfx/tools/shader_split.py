@@ -147,6 +147,66 @@ def nvsd_shaders(d, label):
         cur_g += p_code_len
     return out
 
+def spch_shaders(arh_path, ard_path, label, out):
+    """Monolith Soft SPCH (.wishp) shaders inside bf3.arh / bf3.ard archives (Xenoblade Chronicles 3)."""
+    with open(arh_path, 'rb') as f:
+        hdr = f.read(48)
+        if len(hdr) < 48: return
+        words = struct.unpack('<12I', hdr)
+        f.seek(words[7])
+        entries = [struct.unpack('<6I', f.read(24)) for _ in range(words[8])]
+
+    wishp_indices = [76215, 76293, 76294, 76295, 76296]
+    with open(ard_path, 'rb') as f_ard:
+        for idx in wishp_indices:
+            if idx >= len(entries): continue
+            e = entries[idx]
+            off = e[0] | (e[1] << 32)
+            f_ard.seek(off)
+            xbc1_hdr = f_ard.read(48)
+            if xbc1_hdr[:4] != b'xbc1': continue
+            name = xbc1_hdr[20:48].rstrip(b'\0').decode('ascii', errors='replace')
+            comp_sz = struct.unpack('<4sIII', xbc1_hdr[:16])[3]
+            raw = f_ard.read(comp_sz)
+            d = None
+            try:
+                from compression import zstd
+                d = zstd.decompress(raw)
+            except Exception:
+                pass
+            if d is None:
+                try:
+                    from backports import zstd
+                    d = zstd.decompress(raw)
+                except Exception:
+                    pass
+            if d is None:
+                proc = subprocess.run(['/opt/local/bin/zstd', '-d', '-c', '-q'], input=raw, capture_output=True)
+                if proc.returncode != 0:
+                    proc = subprocess.run(['zstd', '-d', '-c', '-q'], input=raw, capture_output=True)
+                d = proc.stdout
+            if len(d) < 64 or d[:4] not in (b'HCPS', b'SPCH'): continue
+            words = struct.unpack('<16I', d[:64])
+            ctl_base, ctl_size, cur_code = words[10], words[11], words[8]
+            num_ctl = ctl_size // 0x880
+            for i in range(num_ctl):
+                c_off = ctl_base + i * 0x880
+                code_len = struct.unpack_from('<I', d, c_off + 0x704)[0]
+                ctl = d[c_off:c_off + 0x880]
+                code = d[cur_code:cur_code + code_len]
+                code_magic = struct.unpack_from('<I', d, cur_code)[0]
+                if code_magic == 0x12345679:
+                    st = 'cs'
+                else:
+                    sph0 = struct.unpack_from('<I', d, cur_code + 0x30)[0]
+                    st = SPH_STAGE.get((sph0 >> 10) & 0xf, 'vs')
+                why = check(f'{label}#{name}', st, ctl, code)
+                if why:
+                    red(f'{label}#{name} shader {i} {st}: {why}')
+                else:
+                    out.append((f'{label}#{name}#var{i // 2}', st, ctl, code))
+                cur_code += code_len
+
 def glslc_shaders(d, label, need=True):
     """GLSLC compiler outputs (838 in 13 Sentinels' main read-only segment, one stage each): from the magic 0x19866891, +0x44 = the whole output's length; each output holds exactly one control section with the code area right after it (control +0x20 = control length).
     The magic is only 4 bytes and other games' mains have it too (Fire Emblem Engage has 11), so this runs only when the profile's shader_main_glslc is on, and keeps only outputs that pass the triple check.
@@ -470,7 +530,15 @@ def var_pairs(found):
 def scan_file(args):
     """→ (relative path, {key: …}, pairs, extra); extra = this file's Unity type trees, or 'defer' (no type tree, scanned again in the second pass)"""
     path, rel = args[:2]
-    if path.endswith(('.ard', '.webm', '.pck', '.mp4', '.bk2', '.mp3', '.wav', '.ogg')): return rel, {}, set(), {}
+    if path.endswith(('.webm', '.pck', '.mp4', '.bk2', '.mp3', '.wav', '.ogg')): return rel, {}, set(), {}
+    if path.endswith('.ard'): return rel, {}, set(), {}
+    if path.endswith('.arh'):
+        ard_path = path[:-1] + 'd'
+        if os.path.exists(ard_path):
+            found = []
+            spch_shaders(path, ard_path, '/' + rel, found)
+            return rel, uniq_keys(found), var_pairs(found), {}
+        return rel, {}, set(), {}
     with open(path, 'rb') as f: head = f.read(16)
     found = []; trees = {}
     if head[:8] == IDRK:
@@ -586,8 +654,9 @@ def main():
     for name, rr in recs.items():
         with open(os.path.join(pkg, name), 'wb') as f: f.write(b''.join(rr))
     with open(mapout, 'w') as f:
-        kinds = ' / '.join(k for k, hit in (('BNSH / BAHS', any('#BNSH@' in r[4] or '#BAHS@' in r[4] for r in rows)), ('Unity Shader', any('#var' in r[4] and '#BNSH@' not in r[4] and '#MSHD#' not in r[4] and '#SDF#' not in r[4] for r in rows)),
-                                            ('MSHD', any('#MSHD#' in r[4] for r in rows)), ('GLSLC', any('#GLSLC@' in r[4] for r in rows)), ('NVSD', any('#NVSD#' in r[4] for r in rows)), ('RE Engine SDF', any('#SDF#' in r[4] for r in rows))) if hit)
+        kinds = ' / '.join(k for k, hit in (('BNSH / BAHS', any('#BNSH@' in r[4] or '#BAHS@' in r[4] for r in rows)), ('Unity Shader', any('#var' in r[4] and '#BNSH@' not in r[4] and '#MSHD#' not in r[4] and '#SDF#' not in r[4] and '.wishp' not in r[4] for r in rows)),
+                                            ('MSHD', any('#MSHD#' in r[4] for r in rows)), ('GLSLC', any('#GLSLC@' in r[4] for r in rows)), ('NVSD', any('#NVSD#' in r[4] for r in rows)), ('RE Engine SDF', any('#SDF#' in r[4] for r in rows)),
+                                            ('Monolith Soft SPCH', any('.wishp' in r[4] for r in rows))) if hit)
         f.write(f'# kind: evidence  {NOTE} ({kinds} in RomFS + main) → control section + code area keys (dm/gfx/tools/shader_split.py)\n')
         f.write('# column 5 records where each key first appears; this game has no PC version to pair with\n')
         f.write('package\tindex\tstage\tdm_ctl_sha16\tsource\n')
