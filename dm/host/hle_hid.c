@@ -87,7 +87,11 @@ void hid_keys_init(void) {
 
 static uint32_t connected_id(void) { return dm_opmode() == 0 ? NPAD_HANDHELD : NPAD_NO1; }
 uint32_t hle_hid_connected_npad(void) { return connected_id(); }   // nfp's NFC device sits on this controller (hle_sdk16.c)
-static uint32_t style_of(uint32_t id) { return id != connected_id() ? 0 : id == NPAD_HANDHELD ? STYLE_HANDHELD : STYLE_FULLKEY; }
+static uint32_t style_of(uint32_t id) {
+    if (id == NPAD_HANDHELD) return STYLE_HANDHELD;
+    if (id == NPAD_NO1) return STYLE_FULLKEY | STYLE_JOYDUAL;
+    return 0;
+}
 static int32_t ax(uint64_t v, int i) { return (int16_t)(v >> (16 * i)); }
 static int32_t pick(int32_t a, int32_t b) { return (a < 0 ? -a : a) >= (b < 0 ? -b : b) ? a : b; }   // whichever of the two paths is deflected more
 
@@ -198,7 +202,7 @@ HLE_FORCE("_ZN2nn3hid23MergeSingleJoyAsDualJoyERKjS2_", "merge single Joy-Cons; 
 // Bound and signalled once for the controller that is connected (the hid service reports the controller already attached at start the same way). Link's Awakening reads no controller state
 // until this event has fired: without it GetNpadState was never called and the title's "Press L+R" never saw a press
 HLE_FORCE("_ZN2nn3hid27BindNpadStyleSetUpdateEventERKjPNS_2os15SystemEventTypeENS3_14EventClearModeE", "controller style update event: bound, signaled once for the connected controller", void, h_hid_BindStyleEv,
-          const uint32_t *id, void *ev, int clear) { hle_bind_system_event(ev, clear); if (*id == connected_id()) hle_signal_system_event(ev); }
+          const uint32_t *id, void *ev, int clear) { hle_bind_system_event(ev, clear); if (*id == NPAD_HANDHELD || *id == NPAD_NO1 || *id == connected_id()) hle_signal_system_event(ev); }
 HLE_FORCE("_ZN2nn3hid19GetPlayerLedPatternERKj", "player LED: LED 1", uint8_t, h_hid_Led, const uint32_t *id) { (void)id; return 1; }
 // NpadControllerColor = { main RGBA, button RGBA }: grey body, black buttons
 static void ctrl_color(uint32_t *c) { c[0] = 0xff828282u; c[1] = 0xff0f0f0fu; }
