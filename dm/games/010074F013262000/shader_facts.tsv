@@ -4,11 +4,13 @@
 121d68f829de34e5	{"local":[64,1,1],"shared":0}
 162f2ed36260da77	{"local":[16,16,1],"shared":0}
 20ddcfb262852fec	{"local":[64,1,1],"shared":0}
+531d637463e53486	{"fout":{"2":"uint"}}
 5abc9844d234bcae	{"local":[16,16,1],"shared":11280}
 8cabe1ed395bddbd	{"local":[16,1,1],"shared":80}
 9417c75269b574ae	{"local":[64,1,1],"shared":0}
 9ad4c675c6c9756f	{"local":[16,16,1],"shared":0}
 ac9ae141f38b78fb	{"local":[16,16,1],"shared":11280}
 cbadd1e4769f8138	{"local":[16,16,1],"shared":4112}
+d3c541d46f389225	{"fout":{"3":"uint"}}
 d5b5be30dd68a08a	{"local":[16,16,1],"shared":13328}
 f625a4f33c78facd	{"local":[16,16,1],"shared":7184}

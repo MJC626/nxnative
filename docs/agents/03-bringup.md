@@ -23,7 +23,7 @@ $W/run/boot.sh <log name> [seconds] [VAR=value ...]
 | `CRASH sig=… pc=… lr=…` + registers + `bt:` + `stack scan` + thread dump | Crash report: see [05](05-debugging.md) |
 | `thread 0x10xx 'name' … waits:<state> addr=…` | Thread dump: what each guest thread waits on (`address` = address arbiter, `mutex` = mutex with holder, `condvar`, `sync object`, `running/not waiting` = running) |
 
-Useful switches: `DM_FS=1` (file opens, and not-found probes), `DM_SVC=1` (memory SVCs and other syscalls), `DM_THR=1` (thread SVCs), `DM_WATCH=<s>` (dump all threads after s seconds, then exit), `DM_THREAD_DUMP=<frame>,…,*<N>` (dump all threads at those presented frames and every N frames, and keep running: a hang during a loading screen), `DM_PCSAMPLE=<start s>,<length s>[,<thread handle hex>]` (sample the main thread's guest call stack every 2 ms and log the 40 most frequent stacks: the poll site of a loading screen that waits on a condition), `DM_WATCH_STALL=<s>` (dump when the frame loop stops progressing).
+Useful switches: `DM_FS=1` (file opens, and not-found probes), `DM_SVC=1` (memory SVCs and other syscalls), `DM_THR=1` (thread SVCs), `DM_WATCH=<s>` (dump all threads after s seconds, then exit), `DM_THREAD_DUMP=<frame>,…,*<N>` (dump all threads at those presented frames and every N frames, and keep running: a hang during a loading screen), `DM_PCSAMPLE=<start s>,<length s, 0 = until exit>[,<thread handle hex>]` (sample the main thread's guest call stack every 2 ms; every 15 s log the most frequent guest stacks and the inclusive call tree: the poll site of a loading screen that waits on a condition), `DM_WATCH_STALL=<s>` (dump when the frame loop stops progressing).
 
 ## Failure catalogue
 

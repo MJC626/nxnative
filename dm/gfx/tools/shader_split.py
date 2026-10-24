@@ -28,12 +28,13 @@
 #   With an update: give RomFS and main as comma-separated lists (base game first, e.g. data/v0/RomFS,data/v327680/RomFS); the output is the union of both versions (see main())
 #   Unity type trees need Unity's common string table, which is taken from the first main
 # Pair table: (vertex key, pixel key) of every BNSH variation (every Unity program); dmsh_build uses it to give vertex shaders the outputs their pixel shaders read but they do not write (see dmsh_build.py vs_pad)
-import collections, concurrent.futures as cf, hashlib, json, os, re, struct, subprocess, sys
+import collections, concurrent.futures as cf, hashlib, json, os, re, shutil, struct, subprocess, sys, zlib
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../games')); import game as _game
 GAME = _game.load()   # the current game profile (DM_GAME, required): source group rules and the table header note
 GROUPS, NOTE = GAME.pairs('shader_groups'), GAME.get('shader_note')
 GLSLC = GAME.get('shader_main_glslc', 'off') == 'on'   # GLSLC compiler outputs in main (glslc_shaders)
 SEPARABLE = GAME.get('shader_separable', 'off') == 'on'   # single-stage programs combined per stage at draw time (separable_pairs)
+SPCH_ENTRIES = [int(x) for x in GAME.words('shader_spch_entries', '')]   # bf3.arh entries holding SPCH shader packs (spch_shaders)
 CAPTURE = GAME.get('shader_glslc_capture', 'off') == 'on'   # GLSLC outputs the game compiles at run time, captured on the Mac (DM_GLSLC_CAPTURE, hle_glslc.c)
 
 CTL_MAGIC, GFX_MAGIC, CS_MAGIC = bytes.fromhex('34127698'), bytes.fromhex('78563412'), bytes.fromhex('79563412')
@@ -147,65 +148,72 @@ def nvsd_shaders(d, label):
         cur_g += p_code_len
     return out
 
+def xbc1_blocks(raw):
+    """Every xbc1 block of an archive entry → (name, decompressed bytes); header: magic, type (1 = zlib, else zstd), uncompressed size, compressed size, hash, 28-byte name."""
+    i = 0
+    while (i := raw.find(b'xbc1', i)) >= 0:
+        typ, _, csz = struct.unpack_from('<III', raw, i + 4)
+        name = raw[i + 20:i + 48].split(b'\0')[0].decode('ascii', errors='replace')
+        body = raw[i + 48:i + 48 + csz]; i += 48 + csz
+        if typ == 1:
+            try: yield name, zlib.decompress(body)
+            except zlib.error: pass
+            continue
+        d = None
+        for mod in ('compression.zstd', 'backports.zstd'):
+            try: d = __import__(mod, fromlist=['zstd']).decompress(body); break
+            except Exception: pass
+        if d is None:
+            exe = shutil.which('zstd') or '/opt/local/bin/zstd'
+            if not os.path.exists(exe): sys.exit('[RED] shader_split: zstd is needed for xbc1 blocks (MacPorts / Homebrew zstd)')
+            d = subprocess.run([exe, '-d', '-c', '-q'], input=body, capture_output=True).stdout
+        yield name, d
+
 def spch_shaders(arh_path, ard_path, label, out):
-    """Monolith Soft SPCH (.wishp) shaders inside bf3.arh / bf3.ard archives (Xenoblade Chronicles 3)."""
+    """Monolith Soft SPCH shader packs (magic HCPS) inside bf3.arh / bf3.ard (Xenoblade Chronicles 3), from the archive entries the profile lists in shader_spch_entries:
+    the global packs (/monolib/shader/*.wishp, a pack at the start of the block) and each map's .wismda, which embeds the shaders of its own terrain and props (packs at an offset inside a block;
+    the title screen's map ma24a held all 41 shaders its first run reported missing). Every HCPS magic in every xbc1 block of those entries is parsed."""
     with open(arh_path, 'rb') as f:
         hdr = f.read(48)
         if len(hdr) < 48: return
         words = struct.unpack('<12I', hdr)
         f.seek(words[7])
-        entries = [struct.unpack('<6I', f.read(24)) for _ in range(words[8])]
-
-    wishp_indices = [76215, 76293, 76294, 76295, 76296]
+        entries = [struct.unpack('<6I', f.read(24)) for _ in range(words[8])]   # offset low / high, compressed size, size, flags, id
     with open(ard_path, 'rb') as f_ard:
-        for idx in wishp_indices:
-            if idx >= len(entries): continue
+        for idx in SPCH_ENTRIES:
+            if idx >= len(entries): red(f'{label}: shader_spch_entries {idx} is past the archive\'s {len(entries)} entries'); continue
             e = entries[idx]
-            off = e[0] | (e[1] << 32)
-            f_ard.seek(off)
-            xbc1_hdr = f_ard.read(48)
-            if xbc1_hdr[:4] != b'xbc1': continue
-            name = xbc1_hdr[20:48].rstrip(b'\0').decode('ascii', errors='replace')
-            comp_sz = struct.unpack('<4sIII', xbc1_hdr[:16])[3]
-            raw = f_ard.read(comp_sz)
-            d = None
-            try:
-                from compression import zstd
-                d = zstd.decompress(raw)
-            except Exception:
-                pass
-            if d is None:
-                try:
-                    from backports import zstd
-                    d = zstd.decompress(raw)
-                except Exception:
-                    pass
-            if d is None:
-                proc = subprocess.run(['/opt/local/bin/zstd', '-d', '-c', '-q'], input=raw, capture_output=True)
-                if proc.returncode != 0:
-                    proc = subprocess.run(['zstd', '-d', '-c', '-q'], input=raw, capture_output=True)
-                d = proc.stdout
-            if len(d) < 64 or d[:4] not in (b'HCPS', b'SPCH'): continue
-            words = struct.unpack('<16I', d[:64])
-            ctl_base, ctl_size, cur_code = words[10], words[11], words[8]
-            num_ctl = ctl_size // 0x880
-            for i in range(num_ctl):
-                c_off = ctl_base + i * 0x880
-                code_len = struct.unpack_from('<I', d, c_off + 0x704)[0]
-                ctl = d[c_off:c_off + 0x880]
-                code = d[cur_code:cur_code + code_len]
-                code_magic = struct.unpack_from('<I', d, cur_code)[0]
-                if code_magic == 0x12345679:
-                    st = 'cs'
-                else:
-                    sph0 = struct.unpack_from('<I', d, cur_code + 0x30)[0]
-                    st = SPH_STAGE.get((sph0 >> 10) & 0xf, 'vs')
-                why = check(f'{label}#{name}', st, ctl, code)
-                if why:
-                    red(f'{label}#{name} shader {i} {st}: {why}')
-                else:
-                    out.append((f'{label}#{name}#var{i // 2}', st, ctl, code))
-                cur_code += code_len
+            f_ard.seek(e[0] | (e[1] << 32)); raw = f_ard.read((e[2] or e[3]) + 48)   # a compressed entry's size does not count its 48-byte xbc1 header
+            for bi, (name, d) in enumerate(xbc1_blocks(raw)):
+                j = 0
+                while (j := d.find(b'HCPS', j)) >= 0:
+                    tag = f'{name}' if (bi, j) == (0, 0) else f'{idx}.{bi}@{j:x}:{name}'
+                    spch_pack(d[j:], f'{label}#{tag}', out); j += 4
+
+def spch_pack(d, label, out):
+    """One SPCH pack: header words 8 (code area), 10 / 11 (control sections, 0x880 bytes each; +0x704 = code length); stages from the code header (compute: magic 0x12345679)."""
+    if len(d) < 64: return
+    words = struct.unpack('<16I', d[:64])
+    ctl_base, ctl_size, cur_code = words[10], words[11], words[8]
+    if not ctl_size or ctl_base + ctl_size > len(d) or cur_code > len(d): return
+    for i in range(ctl_size // 0x880):
+        c_off = ctl_base + i * 0x880
+        code_len = struct.unpack_from('<I', d, c_off + 0x704)[0]
+        ctl = d[c_off:c_off + 0x880]
+        code = d[cur_code:cur_code + code_len]
+        if len(code) < 0x34: red(f'{label} shader {i}: code area past the pack'); return
+        code_magic = struct.unpack_from('<I', d, cur_code)[0]
+        if code_magic == 0x12345679:
+            st = 'cs'
+        else:
+            sph0 = struct.unpack_from('<I', d, cur_code + 0x30)[0]
+            st = SPH_STAGE.get((sph0 >> 10) & 0xf, 'vs')
+        why = check(label, st, ctl, code)
+        if why:
+            red(f'{label} shader {i} {st}: {why}')
+        else:
+            out.append((f'{label}#var{i // 2}', st, ctl, code))
+        cur_code += code_len
 
 def glslc_shaders(d, label, need=True):
     """GLSLC compiler outputs (838 in 13 Sentinels' main read-only segment, one stage each): from the magic 0x19866891, +0x44 = the whole output's length; each output holds exactly one control section with the code area right after it (control +0x20 = control length).
@@ -533,6 +541,7 @@ def scan_file(args):
     if path.endswith(('.webm', '.pck', '.mp4', '.bk2', '.mp3', '.wav', '.ogg')): return rel, {}, set(), {}
     if path.endswith('.ard'): return rel, {}, set(), {}
     if path.endswith('.arh'):
+        if not SPCH_ENTRIES: return rel, {}, set(), {}
         ard_path = path[:-1] + 'd'
         if os.path.exists(ard_path):
             found = []

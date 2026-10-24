@@ -336,13 +336,33 @@ static void ctx_fill(const thr_t *t, hz_ctx_t *o) {   // holding G, t is stopped
     }
 }
 
-// Guest call-stack sampler (DM_PCSAMPLE=<start s>,<length s>[,<thread handle in hex>], default thread the main thread): every 2 ms from <start> on, suspend the thread, take pc plus the
-// frame-pointer chain (up to 6 guest frames), resume; at the end log the 40 most frequent stacks. A loading screen that polls a condition shows its poll site this way (a thread dump catches the main thread in SleepThread)
-#define PCS_DEPTH 6
+// Guest call-stack sampler (DM_PCSAMPLE=<start s>,<length s, 0 = until exit>[,<thread handle in hex>], default thread the main thread): every 2 ms from <start> on, suspend the thread, take pc plus the
+// frame-pointer chain (up to 24 guest frames), resume. Only samples whose pc is in guest code are tabulated (a thread spinning in SleepThread, e.g. a frame limiter, would bury everything else).
+// Every 15 s, and at the end, log the 30 most frequent stacks and the 80 code addresses found in the most samples (each counted once per sample: the call tree, so a rarely-run poll still shows
+// under its callers). A loading screen that polls a condition shows its poll site this way (a thread dump catches the main thread in SleepThread)
+#define PCS_DEPTH 24
+#define PCS_ADDRS 16384
 #define PCS_SLOTS 8192
-typedef struct { uint64_t f[PCS_DEPTH]; uint32_t n, guest_pc; } pcs_ent_t;
+typedef struct { uint64_t f[PCS_DEPTH]; uint32_t n; } pcs_ent_t;
+typedef struct { uint64_t a; uint32_t n, last; } pcs_addr_t;
 static void pcs_fmt(uint64_t a, char *b, size_t n) { module_t *m = module_of((void *)a); if (m) snprintf(b, n, "%s+%#llx", m->name, (unsigned long long)(a - (uint64_t)m->base)); else snprintf(b, n, "%#llx", (unsigned long long)a); }
+static int pcs_acmp(const void *a, const void *b) { return (int)((const pcs_addr_t *)b)->n - (int)((const pcs_addr_t *)a)->n; }
 static int pcs_cmp(const void *a, const void *b) { return (int)((const pcs_ent_t *)b)->n - (int)((const pcs_ent_t *)a)->n; }
+static void pcs_report(uint32_t handle, const pcs_ent_t *tab, const pcs_addr_t *at, unsigned total, unsigned guest, unsigned lost, double secs, int final) {
+    pcs_ent_t *t = malloc(PCS_SLOTS * sizeof *t); pcs_addr_t *a = malloc(PCS_ADDRS * sizeof *a);
+    if (!t || !a) { free(t); free(a); return; }
+    memcpy(t, tab, PCS_SLOTS * sizeof *t); memcpy(a, at, PCS_ADDRS * sizeof *a);
+    qsort(t, PCS_SLOTS, sizeof *t, pcs_cmp); qsort(a, PCS_ADDRS, sizeof *a, pcs_acmp);
+    LOG("pc sampler %s: thread %#x, %.0f s, %u samples, %u with pc in guest code (tabulated), %u not tabulated; most frequent guest stacks (innermost first):", final ? "final" : "so far", handle, secs, total, guest, lost);
+    for (int i = 0; i < 30 && t[i].n; i++) {
+        char line[1400]; int p = snprintf(line, sizeof line, "pc sample %5u (%4.1f%%)", t[i].n, 100.0 * t[i].n / (guest ? guest : 1));
+        for (int j = 0; j < PCS_DEPTH && t[i].f[j]; j++) { char b[64]; pcs_fmt(t[i].f[j], b, sizeof b); p += snprintf(line + p, sizeof line - p, " %s", b); }
+        LOG("%s", line);
+    }
+    LOG("pc sampler: code addresses in the most guest samples (inclusive):");
+    for (int i = 0; i < 80 && a[i].n; i++) { char b[64]; pcs_fmt(a[i].a, b, sizeof b); LOG("pc incl %5u (%4.1f%%) %s", a[i].n, 100.0 * a[i].n / (guest ? guest : 1), b); }
+    free(t); free(a);
+}
 typedef struct { double start, len; uint32_t handle; } pcs_arg_t;
 static void *pcs_main(void *arg_) {
     pcs_arg_t arg = *(pcs_arg_t *)arg_; free(arg_);
@@ -350,37 +370,41 @@ static void *pcs_main(void *arg_) {
     mach_port_t port = 0;
     pthread_mutex_lock(&G); for (thr_t *t = g_all; t; t = t->all) if (t->handle == arg.handle && !t->exited) port = t->mport; pthread_mutex_unlock(&G);
     if (!port) { LOG("[RED] pc sampler: thread %#x not found", arg.handle); return NULL; }
-    pcs_ent_t *tab = calloc(PCS_SLOTS, sizeof *tab); unsigned total = 0, guest = 0, lost = 0;
-    LOG("pc sampler: thread %#x, %.0f s, every 2 ms", arg.handle, arg.len);
-    for (unsigned k = 0; k < (unsigned)(arg.len * 500); k++) {
+    pcs_ent_t *tab = calloc(PCS_SLOTS, sizeof *tab); pcs_addr_t *at = calloc(PCS_ADDRS, sizeof *at); unsigned total = 0, guest = 0, lost = 0;
+    LOG("pc sampler: thread %#x, %.0f s (0 = until exit), every 2 ms, a report every 15 s", arg.handle, arg.len);
+    struct timespec t0, tn; clock_gettime(CLOCK_MONOTONIC, &t0); double next = 15;
+    for (;;) {
+        clock_gettime(CLOCK_MONOTONIC, &tn); double el = (tn.tv_sec - t0.tv_sec) + (tn.tv_nsec - t0.tv_nsec) / 1e9;
+        if (arg.len > 0 && el >= arg.len) break;
+        if (el >= next) { pcs_report(arg.handle, tab, at, total, guest, lost, el, 0); next += 15; }
         struct timespec iv = {0, 2000000}; nanosleep(&iv, NULL);
         if (thread_suspend(port) != KERN_SUCCESS) break;
-        arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT; pcs_ent_t e = {0};
+        arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT; pcs_ent_t e = {0}; int in_guest = 0;
         if (thread_get_state(port, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) == KERN_SUCCESS) {
             uint64_t pc = __darwin_arm_thread_state64_get_pc(st), fp = __darwin_arm_thread_state64_get_fp(st), lr = __darwin_arm_thread_state64_get_lr(st); unsigned d = 0;
-            if (module_of((void *)pc)) { e.f[d++] = pc; e.guest_pc = 1; if (module_of((void *)lr)) e.f[d++] = lr; }   // a leaf function keeps its caller only in lr
-            for (int j = 0; j < 64 && fp && d < PCS_DEPTH; j++) { uint64_t fr[2]; vm_size_t g = 0;
-                if (vm_read_overwrite(mach_task_self(), fp, 16, (vm_address_t)fr, &g) || g != 16 || fr[0] <= fp) break;
-                if (module_of((void *)fr[1]) && !(d && e.f[d - 1] == fr[1])) e.f[d++] = fr[1];
-                fp = fr[0]; }
+            if (module_of((void *)pc)) { in_guest = 1; e.f[d++] = pc; if (module_of((void *)lr)) e.f[d++] = lr;   // a leaf function keeps its caller only in lr
+                for (int j = 0; j < 64 && fp && d < PCS_DEPTH; j++) { uint64_t fr[2]; vm_size_t g = 0;
+                    if (vm_read_overwrite(mach_task_self(), fp, 16, (vm_address_t)fr, &g) || g != 16 || fr[0] <= fp) break;
+                    if (module_of((void *)fr[1]) && e.f[d - 1] != fr[1]) e.f[d++] = fr[1];
+                    fp = fr[0]; } }
         }
         thread_resume(port);
-        total++; guest += e.guest_pc;
-        uint64_t h = e.guest_pc; for (int j = 0; j < PCS_DEPTH; j++) h = h * 0x9E3779B97F4A7C15ull ^ e.f[j];
+        total++; if (!in_guest) continue;
+        guest++;
+        for (int j = 0; j < PCS_DEPTH && e.f[j]; j++) { unsigned s = (unsigned)((e.f[j] * 0x9E3779B97F4A7C15ull) >> 50) % PCS_ADDRS, probe = 0;
+            while (at[s].a && at[s].a != e.f[j] && probe < PCS_ADDRS) { s = (s + 1) % PCS_ADDRS; probe++; }
+            if (probe == PCS_ADDRS) continue;
+            if (at[s].last != guest) { at[s].a = e.f[j]; at[s].n++; at[s].last = guest; } }
+        uint64_t h = 0; for (int j = 0; j < PCS_DEPTH; j++) h = h * 0x9E3779B97F4A7C15ull ^ e.f[j];
         unsigned s = (unsigned)(h % PCS_SLOTS), probe = 0;
-        while (tab[s].n && (memcmp(tab[s].f, e.f, sizeof e.f) || tab[s].guest_pc != e.guest_pc) && probe < PCS_SLOTS) { s = (s + 1) % PCS_SLOTS; probe++; }
+        while (tab[s].n && memcmp(tab[s].f, e.f, sizeof e.f) && probe < PCS_SLOTS) { s = (s + 1) % PCS_SLOTS; probe++; }
         if (probe == PCS_SLOTS) { lost++; continue; }
-        if (!tab[s].n) { memcpy(tab[s].f, e.f, sizeof e.f); tab[s].guest_pc = e.guest_pc; }
+        if (!tab[s].n) memcpy(tab[s].f, e.f, sizeof e.f);
         tab[s].n++;
     }
-    qsort(tab, PCS_SLOTS, sizeof *tab, pcs_cmp);
-    LOG("pc sampler: thread %#x, %u samples, %u with pc in guest code (the rest in host code: SVCs, HLE functions), %u not tabulated; most frequent stacks (innermost first):", arg.handle, total, guest, lost);
-    for (int i = 0; i < 40 && tab[i].n; i++) {
-        char line[600]; int p = snprintf(line, sizeof line, "pc sample %5u (%4.1f%%) %s", tab[i].n, 100.0 * tab[i].n / (total ? total : 1), tab[i].guest_pc ? "guest" : "host ");
-        for (int j = 0; j < PCS_DEPTH && tab[i].f[j]; j++) { char b[64]; pcs_fmt(tab[i].f[j], b, sizeof b); p += snprintf(line + p, sizeof line - p, " %s", b); }
-        LOG("%s", line);
-    }
-    free(tab);
+    clock_gettime(CLOCK_MONOTONIC, &tn);
+    pcs_report(arg.handle, tab, at, total, guest, lost, (tn.tv_sec - t0.tv_sec) + (tn.tv_nsec - t0.tv_nsec) / 1e9, 1);
+    free(tab); free(at);
     return NULL;
 }
 static void pcs_start(uint32_t main_handle) {

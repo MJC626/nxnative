@@ -284,6 +284,12 @@ OBS = {
     (0x2247a4, 19, '910022d6', 'link request posted (loop at main+0x224728, x19 = request ring): wait for the dispatcher; orig add x22, x22, #8'),
     (0x2248e4, 20, '910022d6', 'unlink request posted (loop at main+0x224868, x19 = request ring): wait for the dispatcher before the object is freed; orig add x22, x22, #8'),
   ],
+  # Xenoblade Chronicles 3 1.0.0 main: the scene / sequence framework updates each child state through vtable +0x40 and treats a return of 1 as done (main+0x550c2c in the
+  # child loop, main+0x5505d0 for the current state). The New Game loading screen never finishes; the host logs which state classes keep returning "not done" (hle_statepoll.c, DM_STATEPOLL=1)
+  '60887a25b66529910275a1066003a002': [
+    (0x550c30, 21, '7100041f', 'child state updated (x21 → entry {state object, ...}, w0 = result, 1 = done); orig cmp w0, #1'),
+    (0x5505d4, 22, '7100041f', 'current state updated ([[x19+0x20]-0x10] = state object, w0 = result, 1 = done); orig cmp w0, #1'),
+  ],
   'db0507f36b84200ac05f75d76ed5026f': [
     (0xb1dc60, 1, 'd10603ff', 'UI message bus virtual implementation entry (x1 = message {u64 type hash, u64 action hash, char* panel name, …}): '
      'the only source of the DM_UIMSG message stream and the DM_BOOTPROF boot phases; orig sub sp, sp, #0x180'),
@@ -965,7 +971,8 @@ for off, oid, ow, why in obs:
     assert f'{w:08x}' == ow, f'observation gate original instruction mismatch {off:#x}: {w:08x}'
     # Function entries, or the instruction right after a bl, only: dm_gate writes back only x0–x8 / x30, and host C code may modify x9–x17; at entry these carry no values under AAPCS64 (arguments are only in x0–x7 / x8),
     # and right after a call returns the callee was free to clobber them anyway (x16 / x17 are the veneer registers)
-    after_bl = off >= 4 and struct.unpack_from('<I', IMG, off - 4)[0] >> 26 == 0x25
+    prev = struct.unpack_from('<I', IMG, off - 4)[0] if off >= 4 else 0
+    after_bl = prev >> 26 == 0x25 or (prev & 0xfffffc1f) == 0xd63f0000   # bl, or blr (an indirect call clobbers x9–x17 just the same)
     assert off in set(starts) or after_bl or (oid == 6 and off == 0x43ecc8), f'private obs point not approved {off:#x}'
     assert off < TEXT_END and off not in kinds and not any(lo <= off < hi for wseg in windows for lo, hi in [(wseg[0].address, wseg[-1].address + 4)]), f'observation gate conflicts with a rewrite site {off:#x}'
     put_branch(off, site_obs(off, oid, w)); stat('obs')

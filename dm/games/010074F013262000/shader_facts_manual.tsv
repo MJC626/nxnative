@@ -1,0 +1,5 @@
+# Hand-written translation facts, merged over the generated rows of shader_facts.tsv by dm/gfx/tools/shader_split.py: key <TAB> facts JSON (same format)
+# The translator declares every fragment output float; Metal refuses a pipeline whose float output meets an integer attachment (the host's red line prints the row to add here).
+# Both from the first device runs on the title screen: an R8Uint target 2 and an R32Uint target 3.
+531d637463e53486	{"fout":{"2":"uint"}}
+d3c541d46f389225	{"fout":{"3":"uint"}}
