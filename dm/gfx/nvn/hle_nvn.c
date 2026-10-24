@@ -1161,10 +1161,18 @@ NVN(nvnQueueAcquireTexture, NVNqueueAcquireTextureResult, NVNqueue *q, NVNwindow
 static uint64_t g_prev[NVN_NFUNC];
 static FILE *g_tsv;
 static void dump_frame(void) {
-    static int inited, nframes = 3, calls = 1;
+    static int inited, nframes = 3, calls = 1, ndump;
+    static uint64_t dump_at[32], dump_every;
     if (!inited) {
         inited = 1;
         const char *e = getenv("DM_NVN_FRAMES"); if (e) nframes = atoi(e);
+        // DM_THREAD_DUMP=<frame>,<frame>,...,*<N>: dump every guest and host thread (svc_thread_dump) at those presented frames, and with *N every N frames; off by default (the dump suspends every thread)
+        const char *d = getenv("DM_THREAD_DUMP");
+        for (const char *p = d; p && *p; p += strcspn(p, ",") + (p[strcspn(p, ",")] == ',')) {
+            if (*p == '*') dump_every = strtoull(p + 1, NULL, 10);
+            else if (ndump < 32) dump_at[ndump++] = strtoull(p, NULL, 10);
+        }
+        if (d && *d) LOG("thread dumps at %d listed frames, every %llu frames (0 = none)", ndump, (unsigned long long)dump_every);
         const char *c = getenv("DM_NVN_TSV_CALLS"); if (c) calls = atoi(c);   // 0 = write only the @ timing rows (pulling files from a real device has a size limit, and the call-count rows take about 2/3)
         const char *t = getenv("DM_NVN_TSV"); if (t && !(g_tsv = fopen(t, "w"))) LOG("[RED] cannot open %s", t);
         if (g_tsv) fprintf(g_tsv, "# kind: nvn-per-frame  value = call count when name is an NVN function name; names starting with @ are timing probes (ms / count)\nframe\tname\tvalue\n");
@@ -1182,7 +1190,8 @@ static void dump_frame(void) {
     if (g_tsv) fflush(g_tsv);
     if (g_frame <= (uint64_t)nframes) LOG("[nvn] %s %llu: %u functions %llu calls |%s", g_frame ? "frame" : "init", g_frame, nfn, total, line);
     else if (g_frame % 300 == 0) LOG("[nvn] frame %llu: %u functions %llu calls", g_frame, nfn, total);
-    if (g_frame == 60 || g_frame == 300) { void svc_thread_dump(void); svc_thread_dump(); }
+    { int hit = dump_every && g_frame && g_frame % dump_every == 0; for (int i = 0; i < ndump && !hit; i++) hit = g_frame == dump_at[i];
+      if (hit) { void svc_thread_dump(void); LOG("thread dump at frame %llu", g_frame); svc_thread_dump(); } }
     g_frame++; cs_dump();
     // Every 300 frames read resident memory and hand it to the graphics layer to print the memory readout line (mtl_mem_stat, low frequency, capped). Memory watchdog: when resident memory exceeds the cap, log a failure and exit on its own. On by default only on the Mac host (24 GB: runaway host memory
     // drags the whole machine into a kernel panic, which happened twice with other programs on the same machine), or set for tests with DM_MEM_CAP_GB=<integer>; the player's iOS app has no cap (exiting before the system kills it is pointless and only adds another kind of crash)
