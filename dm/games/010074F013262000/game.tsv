@@ -49,6 +49,8 @@ shader_note	Xenoblade Chronicles 3 shaders (provisional profile)
 shader_main_glslc	on
 # with shader_main_glslc: single-stage programs combined per draw (every GLSLC output in main seen so far is one stage)
 shader_separable	on
-# bf3.arh entries holding SPCH shader packs: the 5 global packs /monolib/shader/*.wishp (76215, 76293-76296) and the 23 maps /map/*.wismda, which embed their own terrain and prop shaders
-# (the title screen's map ma24a = 67424 held the 41 shaders the first run reported missing)
-shader_spch_entries	76215 76293 76294 76295 76296 67360 67365 67370 67375 67380 67385 67390 67397 67402 67407 67414 67419 67424 67429 67434 67439 67444 67449 67454 67459 67464 67469 67474
+# bf3.arh entries holding SPCH shader packs: all of them. Besides the 5 global /monolib/shader/*.wishp packs and the 23 /map/*.wismda (which embed their terrain and prop shaders;
+# the title map ma24a held the 41 shaders the first run missed), the stored /chr/**/*.wismt model streams carry packs inside inner xbc1 blocks (219 of the 354 shaders the first field missed)
+shader_spch_entries	all
+# bf3.arh entries whose GLSLC compiler outputs are shaders: /effect/cmn_assets.wipac (1,362 outputs; 90 of the shaders the first field missed)
+shader_glslc_entries	53899

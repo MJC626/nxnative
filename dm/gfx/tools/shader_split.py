@@ -34,7 +34,9 @@ GAME = _game.load()   # the current game profile (DM_GAME, required): source gro
 GROUPS, NOTE = GAME.pairs('shader_groups'), GAME.get('shader_note')
 GLSLC = GAME.get('shader_main_glslc', 'off') == 'on'   # GLSLC compiler outputs in main (glslc_shaders)
 SEPARABLE = GAME.get('shader_separable', 'off') == 'on'   # single-stage programs combined per stage at draw time (separable_pairs)
-SPCH_ENTRIES = [int(x) for x in GAME.words('shader_spch_entries', '')]   # bf3.arh entries holding SPCH shader packs (spch_shaders)
+SPCH_ALL = GAME.words('shader_spch_entries', '') == ['all']   # bf3.arh entries holding SPCH shader packs (spch_shaders): a list, or all
+SPCH_ENTRIES = [] if SPCH_ALL else [int(x) for x in GAME.words('shader_spch_entries', '')]
+GLSLC_ENTRIES = [int(x) for x in GAME.words('shader_glslc_entries', '')]   # bf3.arh entries holding GLSLC outputs (spch_shaders)
 CAPTURE = GAME.get('shader_glslc_capture', 'off') == 'on'   # GLSLC outputs the game compiles at run time, captured on the Mac (DM_GLSLC_CAPTURE, hle_glslc.c)
 
 CTL_MAGIC, GFX_MAGIC, CS_MAGIC = bytes.fromhex('34127698'), bytes.fromhex('78563412'), bytes.fromhex('79563412')
@@ -169,28 +171,56 @@ def xbc1_blocks(raw):
             d = subprocess.run([exe, '-d', '-c', '-q'], input=body, capture_output=True).stdout
         yield name, d
 
-def spch_shaders(arh_path, ard_path, label, out):
-    """Monolith Soft SPCH shader packs (magic HCPS) inside bf3.arh / bf3.ard (Xenoblade Chronicles 3), from the archive entries the profile lists in shader_spch_entries:
-    the global packs (/monolib/shader/*.wishp, a pack at the start of the block) and each map's .wismda, which embeds the shaders of its own terrain and props (packs at an offset inside a block;
-    the title screen's map ma24a held all 41 shaders its first run reported missing). Every HCPS magic in every xbc1 block of those entries is parsed."""
+def arh_entries(arh_path):
+    """bf3.arh's file table → [(offset low, offset high, compressed size, size, flags, id)]; a stored entry has size 0 and its length in the compressed-size field"""
     with open(arh_path, 'rb') as f:
         hdr = f.read(48)
-        if len(hdr) < 48: return
+        if len(hdr) < 48: return []
         words = struct.unpack('<12I', hdr)
         f.seek(words[7])
-        entries = [struct.unpack('<6I', f.read(24)) for _ in range(words[8])]   # offset low / high, compressed size, size, flags, id
-    with open(ard_path, 'rb') as f_ard:
-        for idx in SPCH_ENTRIES:
-            if idx >= len(entries): red(f'{label}: shader_spch_entries {idx} is past the archive\'s {len(entries)} entries'); continue
-            e = entries[idx]
-            f_ard.seek(e[0] | (e[1] << 32)); raw = f_ard.read((e[2] or e[3]) + 48)   # a compressed entry's size does not count its 48-byte xbc1 header
-            for bi, (name, d) in enumerate(xbc1_blocks(raw)):
-                j = 0
-                while (j := d.find(b'HCPS', j)) >= 0:
-                    tag = f'{name}' if (bi, j) == (0, 0) else f'{idx}.{bi}@{j:x}:{name}'
-                    spch_pack(d[j:], f'{label}#{tag}', out); j += 4
+        return [struct.unpack('<6I', f.read(24)) for _ in range(words[8])]
 
-def spch_pack(d, label, out):
+def ard_blobs(f_ard, idx, e):
+    """One archive entry → [(tag, data)]: a compressed entry's xbc1 blocks (tag = block number, name), a stored entry's own bytes (tag 'raw'; .wismt streams keep xbc1 blocks at inner
+    offsets), plus one level of xbc1 blocks found inside those (tag 'block.block')"""
+    f_ard.seek(e[0] | (e[1] << 32)); raw = f_ard.read(e[2] + 48)   # a compressed entry's size does not count its 48-byte xbc1 header
+    if not e[3]: raw = raw[:e[2]]
+    out = [(str(bi), name, d) for bi, (name, d) in enumerate(xbc1_blocks(raw))] if raw[:4] == b'xbc1' else [('raw', '', raw)] + [(f'raw.{bi}', name, d) for bi, (name, d) in enumerate(xbc1_blocks(raw))]
+    out += [(f'{t}.{bj}', n2, d2) for t, _, d in list(out) if t != 'raw' and b'xbc1' in d for bj, (n2, d2) in enumerate(xbc1_blocks(d))]
+    return out
+
+def spch_entry(ard_path, idx, e, label, glslc):
+    """SPCH packs (and, for shader_glslc_entries, GLSLC outputs) of one archive entry → (shaders, number of shaders skipped by the check)"""
+    out, skipped = [], [0]
+    def red_skip(msg):
+        if not SPCH_ALL: red(msg)
+        skipped[0] += 1
+    with open(ard_path, 'rb') as f_ard:
+        for t, name, d in ard_blobs(f_ard, idx, e):
+            j = 0
+            while (j := d.find(b'HCPS', j)) >= 0:
+                tag = name if (t, j) == ('0', 0) else f'{idx}.{t}@{j:x}:{name}'   # the same labels as before for compressed entries' own blocks
+                spch_pack(d[j:], f'{label}#{tag}', out, red_skip); j += 4
+            if glslc: out += glslc_shaders(d, f'{label}#{idx}.{t}:{name}', need=False)
+    return out, skipped[0]
+
+def spch_shaders(arh_path, ard_path, label, out):
+    """Monolith Soft SPCH shader packs (magic HCPS) inside bf3.arh / bf3.ard (Xenoblade Chronicles 3), from the archive entries the profile lists in shader_spch_entries (or all of them):
+    the global packs (/monolib/shader/*.wishp, a pack at the start of the block), each map's .wismda (its terrain and props), and the models' stored .wismt streams (characters: packs
+    inside xbc1 blocks at inner offsets of a stored entry). Every HCPS magic in every block is parsed. shader_glslc_entries adds the GLSLC compiler outputs of the entries it lists
+    (XC3's effects: /effect/cmn_assets.wipac holds 1,362). Entries are read on threads (zlib releases the GIL); results keep the archive order"""
+    entries = arh_entries(arh_path)
+    want = range(len(entries)) if SPCH_ALL else SPCH_ENTRIES
+    for idx in list(want) + GLSLC_ENTRIES:
+        if idx >= len(entries): red(f'{label}: archive entry {idx} is past the archive\'s {len(entries)} entries')
+    todo = sorted(set(want) | set(GLSLC_ENTRIES))
+    with cf.ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as ex:
+        res = list(ex.map(lambda i: spch_entry(ard_path, i, entries[i], label, i in GLSLC_ENTRIES), todo))
+    skipped = 0
+    for sh, sk in res: out += sh; skipped += sk
+    if skipped: print(f'[RED] {label}: {skipped} SPCH shaders failed the check and were skipped (shader_spch_entries all)', file=sys.stderr)
+
+def spch_pack(d, label, out, red=red):
     """One SPCH pack: header words 8 (code area), 10 / 11 (control sections, 0x880 bytes each; +0x704 = code length); stages from the code header (compute: magic 0x12345679)."""
     if len(d) < 64: return
     words = struct.unpack('<16I', d[:64])
@@ -541,7 +571,7 @@ def scan_file(args):
     if path.endswith(('.webm', '.pck', '.mp4', '.bk2', '.mp3', '.wav', '.ogg')): return rel, {}, set(), {}
     if path.endswith('.ard'): return rel, {}, set(), {}
     if path.endswith('.arh'):
-        if not SPCH_ENTRIES: return rel, {}, set(), {}
+        if not (SPCH_ALL or SPCH_ENTRIES or GLSLC_ENTRIES): return rel, {}, set(), {}
         ard_path = path[:-1] + 'd'
         if os.path.exists(ard_path):
             found = []
