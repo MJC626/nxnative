@@ -3,6 +3,11 @@
 // Environment switches: DM_OPMODE=0 handheld / 1 console (default: the profile's op_mode, console unless set; console corresponds to the console-mode render profile); DM_LANG=language code (default en-US).
 #include "hle.h"
 #include "dm_uiscreen.h"
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#include <CoreFoundation/CoreFoundation.h>
+#endif
+#include <strings.h>
 
 // The operation mode is runtime state (the front end can change it: iOS overheat downgrade switches to handheld): the single source is here, taken once from DM_OPMODE at startup, the environment variable is not read again afterwards
 #include <stdatomic.h>
@@ -299,11 +304,88 @@ HLE_FORCE("_ZN2nn2oe28SetResumeNotificationEnabledEb", "resume notification swit
 HLE_FORCE("_ZN2nn2oe42SetOperationModeChangedNotificationEnabledEb", "operation mode change notification switch", void, h_oe_SetOpModeNtf, unsigned on) { g_ntf_opmode = on & 0xff; }
 HLE_FORCE("_ZN2nn2oe44SetPerformanceModeChangedNotificationEnabledEb", "performance mode change notification switch", void, h_oe_SetPerfModeNtf, unsigned on) { g_ntf_perfmode = on & 0xff; }
 
-// nn::settings::LanguageCode = struct { char string[8]; }, 8 bytes returned by value in x0
-HLE_FORCE("_ZN2nn2oe18GetDesiredLanguageEv", "system language query; value from DM_LANG", uint64_t, h_oe_GetLang, void) {
+static void normalize_lang_code(char code[8], const char *src) {
+    if (!src || !*src) {
+        strncpy(code, DM_GAME_DEFAULT_LANG, 7);
+        code[7] = 0;
+        return;
+    }
+    if (!strcasecmp(src, "zh") || !strcasecmp(src, "zh-cn") || !strcasecmp(src, "zh_cn") || !strcasecmp(src, "cn") || !strcasecmp(src, "zh-Hans")) {
+        strcpy(code, "zh-Hans");
+    } else if (!strcasecmp(src, "zh-tw") || !strcasecmp(src, "zh_tw") || !strcasecmp(src, "tw") || !strcasecmp(src, "zh-hk") || !strcasecmp(src, "zh_hk") || !strcasecmp(src, "hk") || !strcasecmp(src, "zh-Hant")) {
+        strcpy(code, "zh-Hant");
+    } else if (!strcasecmp(src, "ja") || !strcasecmp(src, "jp")) {
+        strcpy(code, "ja");
+    } else if (!strcasecmp(src, "ko") || !strcasecmp(src, "kr")) {
+        strcpy(code, "ko");
+    } else if (!strcasecmp(src, "en") || !strcasecmp(src, "en-US") || !strcasecmp(src, "us") || !strcasecmp(src, "en_US")) {
+        if (DM_GAME_PROGRAM_ID == 0x010074F013262000ull) {
+            strcpy(code, "en-GB"); // XC3 does not support American English (en-US)
+        } else {
+            strcpy(code, "en-US");
+        }
+    } else if (!strcasecmp(src, "en-GB") || !strcasecmp(src, "gb") || !strcasecmp(src, "en_GB")) {
+        strcpy(code, "en-GB");
+    } else {
+        strncpy(code, src, 7);
+        code[7] = 0;
+    }
+}
+
+static void get_desired_lang_code(char code[8]) {
     const char *e = getenv("DM_LANG");
+    if (e && *e) {
+        normalize_lang_code(code, e);
+        LOG("language: '%s' (from env DM_LANG='%s')", code, e);
+        return;
+    }
+#if TARGET_OS_IPHONE
+    CFArrayRef langs = CFLocaleCopyPreferredLanguages();
+    if (langs) {
+        if (CFArrayGetCount(langs) > 0) {
+            char pref[64] = {0};
+            if (CFStringGetCString((CFStringRef)CFArrayGetValueAtIndex(langs, 0), pref, sizeof pref, kCFStringEncodingUTF8)) {
+                if (!strncasecmp(pref, "zh", 2)) {
+                    if (strcasestr(pref, "Hant") || strcasestr(pref, "TW") || strcasestr(pref, "HK"))
+                        strcpy(code, "zh-Hant");
+                    else
+                        strcpy(code, "zh-Hans");
+                } else if (!strncasecmp(pref, "en", 2)) {
+                    if (DM_GAME_PROGRAM_ID == 0x010074F013262000ull)
+                        strcpy(code, "en-GB");
+                    else
+                        strcpy(code, "en-US");
+                } else if (!strncasecmp(pref, "ja", 2)) {
+                    strcpy(code, "ja");
+                } else if (!strncasecmp(pref, "ko", 2)) {
+                    strcpy(code, "ko");
+                } else if (!strncasecmp(pref, "fr", 2)) {
+                    strcpy(code, "fr");
+                } else if (!strncasecmp(pref, "de", 2)) {
+                    strcpy(code, "de");
+                } else if (!strncasecmp(pref, "es", 2)) {
+                    strcpy(code, "es");
+                } else if (!strncasecmp(pref, "it", 2)) {
+                    strcpy(code, "it");
+                } else {
+                    normalize_lang_code(code, pref);
+                }
+                CFRelease(langs);
+                LOG("language: '%s' (from iOS preferred language '%s')", code, pref);
+                return;
+            }
+        }
+        CFRelease(langs);
+    }
+#endif
+    normalize_lang_code(code, DM_GAME_DEFAULT_LANG);
+    LOG("language: '%s' (profile default)", code);
+}
+
+// nn::settings::LanguageCode = struct { char string[8]; }, 8 bytes returned by value in x0
+HLE_FORCE("_ZN2nn2oe18GetDesiredLanguageEv", "system language query; value from DM_LANG or profile default", uint64_t, h_oe_GetLang, void) {
     char code[8] = {0};
-    strncpy(code, e && *e ? e : "en-US", sizeof code - 1);
+    get_desired_lang_code(code);
     uint64_t v; memcpy(&v, code, 8);
     return v;
 }

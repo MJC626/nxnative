@@ -11,6 +11,7 @@ ipa	XenobladeChronicles3.ipa
 app_category	public.app-category.games
 pad_layout	simple
 op_mode	handheld
+default_lang	zh-Hans
 
 # ---- Versions ----
 build	v0	1.0.0	main=60887a25b66529910275a1066003a002	subsdk0=be1ee79a9968a35a6b63fc8f1036a6d4	sdk=e8cdceb1e77a8465fe20f21928e8d296

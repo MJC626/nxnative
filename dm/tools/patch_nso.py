@@ -93,6 +93,9 @@ CUTS = {
     (0xb7fcfc, '78890694', 'a1831ff8', 'tutorial container null check: bl 0xd222dc → stur x1,[x29,#-8]', 'host-only'),
     (0xb7fe90, 'a02300d1', '410300b4', 'tutorial container null check: sub x0,x29,#8 → cbz x1,0xb7fef8', 'host-only'),
     (0xb7fe94, '12890694', 'a1831ff8', 'tutorial container null check: bl 0xd222dc → stur x1,[x29,#-8]', 'host-only'),
+    (0x36e7c, '53a33c94', '1ebf3c94', 'language init: bl 0xf5fbc8 → bl 0xf66af4 (call GetDesiredLanguage directly)', 'host-only'),
+    (0xf618, 'e80100b4', '179e0094', 'language notification: cbz x8,0xf654 → bl 0x36e74 (unconditional language init)', 'host-only'),
+    (0xf61c, '169e0094', 'c80100b4', 'language notification: bl 0x36e74 → cbz x8,0xf654 (branch after language init)', 'host-only'),
   ],
   # Super Mario Bros. Wonder v0 main
   'cd6e42aee7934f4d8393cd43893ae25e': [
