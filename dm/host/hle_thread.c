@@ -336,7 +336,8 @@ static void ctx_fill(const thr_t *t, hz_ctx_t *o) {   // holding G, t is stopped
     }
 }
 
-// Guest call-stack sampler (DM_PCSAMPLE=<start s>,<length s, 0 = until exit>[,<thread handle in hex>], default thread the main thread): every 2 ms from <start> on, suspend the thread, take pc plus the
+// Guest call-stack sampler (DM_PCSAMPLE=<start s>,<length s, 0 = until exit>[,<thread handle in hex> | all], default thread the main thread; all = every guest thread alive at <start>, every 5 ms, a
+// report only for threads that ran guest code, shorter): every 2 ms from <start> on, suspend the thread, take pc plus the
 // frame-pointer chain (up to 24 guest frames), resume. Only samples whose pc is in guest code are tabulated (a thread spinning in SleepThread, e.g. a frame limiter, would bury everything else).
 // Every 15 s, and at the end, log the 30 most frequent stacks and the 80 code addresses found in the most samples (each counted once per sample: the call tree, so a rarely-run poll still shows
 // under its callers). A loading screen that polls a condition shows its poll site this way (a thread dump catches the main thread in SleepThread)
@@ -348,36 +349,46 @@ typedef struct { uint64_t a; uint32_t n, last; } pcs_addr_t;
 static void pcs_fmt(uint64_t a, char *b, size_t n) { module_t *m = module_of((void *)a); if (m) snprintf(b, n, "%s+%#llx", m->name, (unsigned long long)(a - (uint64_t)m->base)); else snprintf(b, n, "%#llx", (unsigned long long)a); }
 static int pcs_acmp(const void *a, const void *b) { return (int)((const pcs_addr_t *)b)->n - (int)((const pcs_addr_t *)a)->n; }
 static int pcs_cmp(const void *a, const void *b) { return (int)((const pcs_ent_t *)b)->n - (int)((const pcs_ent_t *)a)->n; }
-static void pcs_report(uint32_t handle, const pcs_ent_t *tab, const pcs_addr_t *at, unsigned total, unsigned guest, unsigned lost, double secs, int final) {
+static void pcs_report(uint32_t handle, const pcs_ent_t *tab, const pcs_addr_t *at, unsigned total, unsigned guest, unsigned lost, double secs, int final, int compact) {
+    if (compact && !guest) return;
     pcs_ent_t *t = malloc(PCS_SLOTS * sizeof *t); pcs_addr_t *a = malloc(PCS_ADDRS * sizeof *a);
     if (!t || !a) { free(t); free(a); return; }
     memcpy(t, tab, PCS_SLOTS * sizeof *t); memcpy(a, at, PCS_ADDRS * sizeof *a);
     qsort(t, PCS_SLOTS, sizeof *t, pcs_cmp); qsort(a, PCS_ADDRS, sizeof *a, pcs_acmp);
     LOG("pc sampler %s: thread %#x, %.0f s, %u samples, %u with pc in guest code (tabulated), %u not tabulated; most frequent guest stacks (innermost first):", final ? "final" : "so far", handle, secs, total, guest, lost);
-    for (int i = 0; i < 30 && t[i].n; i++) {
-        char line[1400]; int p = snprintf(line, sizeof line, "pc sample %5u (%4.1f%%)", t[i].n, 100.0 * t[i].n / (guest ? guest : 1));
+    for (int i = 0; i < (compact ? 8 : 30) && t[i].n; i++) {
+        char line[1400]; int p = snprintf(line, sizeof line, "pc sample %#x %5u (%4.1f%%)", handle, t[i].n, 100.0 * t[i].n / (guest ? guest : 1));
         for (int j = 0; j < PCS_DEPTH && t[i].f[j]; j++) { char b[64]; pcs_fmt(t[i].f[j], b, sizeof b); p += snprintf(line + p, sizeof line - p, " %s", b); }
         LOG("%s", line);
     }
     LOG("pc sampler: code addresses in the most guest samples (inclusive):");
-    for (int i = 0; i < 80 && a[i].n; i++) { char b[64]; pcs_fmt(a[i].a, b, sizeof b); LOG("pc incl %5u (%4.1f%%) %s", a[i].n, 100.0 * a[i].n / (guest ? guest : 1), b); }
+    for (int i = 0; i < (compact ? 20 : 80) && a[i].n; i++) { char b[64]; pcs_fmt(a[i].a, b, sizeof b); LOG("pc incl %#x %5u (%4.1f%%) %s", handle, a[i].n, 100.0 * a[i].n / (guest ? guest : 1), b); }
     free(t); free(a);
 }
-typedef struct { double start, len; uint32_t handle; } pcs_arg_t;
+typedef struct { double start, len; uint32_t handle; long period_ns; int compact; } pcs_arg_t;
 static void *pcs_main(void *arg_) {
     pcs_arg_t arg = *(pcs_arg_t *)arg_; free(arg_);
-    struct timespec ts = {(time_t)arg.start, (long)((arg.start - (time_t)arg.start) * 1e9)}; nanosleep(&ts, NULL);
+    struct timespec ts = {(time_t)arg.start, (long)((arg.start - (time_t)arg.start) * 1e9)}; if (arg.start > 0) nanosleep(&ts, NULL);
+    if (!arg.handle) {   // all: one sampler per guest thread alive now
+        uint32_t hs[256]; int n = 0;
+        pthread_mutex_lock(&G); for (thr_t *t = g_all; t && n < 256; t = t->all) if (!t->exited && t->mport) hs[n++] = t->handle; pthread_mutex_unlock(&G);
+        LOG("pc sampler: all %d guest threads, every 5 ms", n);
+        for (int i = 0; i < n; i++) { pcs_arg_t *a = calloc(1, sizeof *a); *a = arg; a->start = 0; a->handle = hs[i]; a->period_ns = 5000000; a->compact = 1;
+            pthread_t th; if (pthread_create(&th, NULL, pcs_main, a)) free(a); else pthread_detach(th); }
+        return NULL;
+    }
     mach_port_t port = 0;
     pthread_mutex_lock(&G); for (thr_t *t = g_all; t; t = t->all) if (t->handle == arg.handle && !t->exited) port = t->mport; pthread_mutex_unlock(&G);
     if (!port) { LOG("[RED] pc sampler: thread %#x not found", arg.handle); return NULL; }
     pcs_ent_t *tab = calloc(PCS_SLOTS, sizeof *tab); pcs_addr_t *at = calloc(PCS_ADDRS, sizeof *at); unsigned total = 0, guest = 0, lost = 0;
-    LOG("pc sampler: thread %#x, %.0f s (0 = until exit), every 2 ms, a report every 15 s", arg.handle, arg.len);
+    if (!arg.period_ns) arg.period_ns = 2000000;
+    if (!arg.compact) LOG("pc sampler: thread %#x, %.0f s (0 = until exit), every 2 ms, a report every 15 s", arg.handle, arg.len);
     struct timespec t0, tn; clock_gettime(CLOCK_MONOTONIC, &t0); double next = 15;
     for (;;) {
         clock_gettime(CLOCK_MONOTONIC, &tn); double el = (tn.tv_sec - t0.tv_sec) + (tn.tv_nsec - t0.tv_nsec) / 1e9;
         if (arg.len > 0 && el >= arg.len) break;
-        if (el >= next) { pcs_report(arg.handle, tab, at, total, guest, lost, el, 0); next += 15; }
-        struct timespec iv = {0, 2000000}; nanosleep(&iv, NULL);
+        if (el >= next) { pcs_report(arg.handle, tab, at, total, guest, lost, el, 0, arg.compact); next += 15; }
+        struct timespec iv = {0, arg.period_ns}; nanosleep(&iv, NULL);
         if (thread_suspend(port) != KERN_SUCCESS) break;
         arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT; pcs_ent_t e = {0}; int in_guest = 0;
         if (thread_get_state(port, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) == KERN_SUCCESS) {
@@ -403,15 +414,51 @@ static void *pcs_main(void *arg_) {
         tab[s].n++;
     }
     clock_gettime(CLOCK_MONOTONIC, &tn);
-    pcs_report(arg.handle, tab, at, total, guest, lost, (tn.tv_sec - t0.tv_sec) + (tn.tv_nsec - t0.tv_nsec) / 1e9, 1);
+    pcs_report(arg.handle, tab, at, total, guest, lost, (tn.tv_sec - t0.tv_sec) + (tn.tv_nsec - t0.tv_nsec) / 1e9, 1, arg.compact);
     free(tab); free(at);
     return NULL;
+}
+// Condition variable rescue (DM_CV_KICK=<seconds>): every N s, wake every thread that has waited on a condition key for a whole interval, as SignalProcessWideKey would (it re-takes its lock).
+// Condition variables may always wake spuriously and correct callers re-check their predicate, so this cannot break correct code; it only rescues a waiter whose wakeup was lost, e.g. a
+// thread waiting in nn::os::WaitEvent while another thread re-initializes that event (InitializeEvent zeroes the condition key at +0x20, so the later SignalEvent sees "no waiters" and makes
+// no svc). The first rescue of each thread is logged with its event fields when the key sits at EventType +0x20 (+0x10 signaled, +0x11 initially signaled, +0x12 clear mode, +0x13 state)
+static void *cvk_main(void *arg) {
+    unsigned secs = (unsigned)(uintptr_t)arg; uint64_t last_seq = 0; static uint32_t seen[256]; int nseen = 0; uint64_t total = 0;
+    LOG("condvar rescue: every %u s", secs);
+    for (;;) {
+        struct timespec ts = {(time_t)secs, 0}; nanosleep(&ts, NULL);
+        pthread_mutex_lock(&G);
+        int n = 0;
+        for (int again = 1; again;) { again = 0;
+            for (thr_t *t = g_wait; t; t = t->next) {
+                if (t->wkind != 2 || t->wseq > last_seq) continue;
+                uint64_t key = t->wkey; int first = 1;
+                for (int i = 0; i < nseen; i++) if (seen[i] == t->handle) first = 0;
+                if (first && nseen < 256) { seen[nseen++] = t->handle; char nb[32]; uint8_t ev[4] = {0}; vm_size_t g = 0;
+                    int isev = !vm_read_overwrite(mach_task_self(), key - 0x10, 4, (vm_address_t)ev, &g) && g == 4;
+                    LOG("condvar rescue: thread %#x '%s' woken after waiting on key %#llx (lock %#llx), event-like fields at key-0x10: signaled %u initially %u clear %u state %u",
+                        t->handle, thr_name(t, nb, sizeof nb), (unsigned long long)key, (unsigned long long)t->waddr, isev ? ev[0] : 0, isev ? ev[1] : 0, isev ? ev[2] : 0, isev ? ev[3] : 0); }
+                lock_acquire_for(t, t->waddr, t->wtag); n++;
+                int left = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == key) { left = 1; break; }
+                if (!left) st32(key, 0);
+                again = 1; break;   // g_wait changed (wake unlinks): rescan
+            }
+        }
+        last_seq = g_wseq; total += n;
+        pthread_mutex_unlock(&G);
+        if (n) { static int lines; if (lines++ < 40) LOG("condvar rescue: %d waiters woken this round (%llu in all)", n, (unsigned long long)total); }
+    }
+    return NULL;
+}
+static void cvk_start(void) {
+    const char *e = getenv("DM_CV_KICK"); int s = e ? atoi(e) : 0; if (s <= 0) return;
+    pthread_t th; if (!pthread_create(&th, NULL, cvk_main, (void *)(uintptr_t)s)) pthread_detach(th);
 }
 static void pcs_start(uint32_t main_handle) {
     const char *e = getenv("DM_PCSAMPLE"); if (!e || !*e) return;
     pcs_arg_t *a = calloc(1, sizeof *a); a->len = 10; a->handle = main_handle;
     char *p; a->start = strtod(e, &p);
-    if (*p == ',') { a->len = strtod(p + 1, &p); if (*p == ',') a->handle = (uint32_t)strtoul(p + 1, NULL, 16); }
+    if (*p == ',') { a->len = strtod(p + 1, &p); if (*p == ',') a->handle = !strncmp(p + 1, "all", 3) ? 0 : (uint32_t)strtoul(p + 1, NULL, 16); }   // "all" first: strtoul would read its 'a' as hex 0xa
     pthread_t th; if (pthread_create(&th, NULL, pcs_main, a)) { free(a); return; } pthread_detach(th);
 }
 
@@ -428,6 +475,7 @@ uint32_t svc_thread_main_init(void) {
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
     pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
     pcs_start(t->handle);
+    cvk_start();
     return t->handle;
 }
 

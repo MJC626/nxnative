@@ -55,20 +55,24 @@ CUTS = {
   'e8cdceb1e77a8465fe20f21928e8d296': [
     (0x346430, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000', 'host-only'),
     (0x3464cc, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000', 'host-only'),
+    (0x34662c, '0a00a852', '0a40a052', 'AddressRegionManager placement: regions of 1 GB or more aligned to 1 GB → 32 MB (mov w10,#0x40000000 → #0x2000000): Xenoblade Chronicles 3\'s 4 GB region starts right after the 62 MB node area instead of at alias +0.75 GB (only XC3 uses this sdk build)', 'host-only'),
   ],
-  # Xenoblade Chronicles 3 1.0.0 (v0) main: virtual address region reservation 60 GB (0xf00000000) → 3.25 GB (0xd0000000),
-  # internal dynamic allocation arena 4 GB (0x100020000) → 1.0 GB (0x40020000),
-  # allocator capacity check bypass (allows large GPU texture pools to allocate from 2.25 GB large-block headroom),
+  # Xenoblade Chronicles 3 1.0.0 (v0) main: virtual address region reservation 60 GB (0xf00000000) → 4 GB (0x100000000),
+  # internal dynamic allocation arena 4 GB (0x100020000) → 0.75 GB (0x30020000),
+  # allocator capacity check bypass (allows large GPU texture pools to allocate from 3.25 GB large-block headroom),
+  # (with 2.25 GB a 277 MB block, size class 46, failed at boot after the two 512 MB GPU pool chunks: New Game then read only map ma01a's headers and stalled on its loading screen;
+  # with 2.75 GB New Game loaded map ma01a's files and then failed a 390 MB block (class 47) and 65 MB ones; the sdk cut at 0x34662c drops the 1 GB alignment that put the region at
+  # alias +0.75 GB, so the 4 GB region starts at +64 MB, ends at +4.06 GB, and the 64 MB reserve region plus 0.25 GB headroom fit under the 4.375 GB alias region),
   # and physical RAM probe bypass (original probes memory by allocating 1 MB pages in a loop until failure; on host SVC 0x2C never fails,
   # leaving all 3 GB mapped and held in memory, causing subsequent NVN memory pools to fail). Bypass directly sets available RAM to 2.5 GB.
   # iOS caps guest address space to 5 GB (alias region 4.375 GB).
   '60887a25b66529910275a1066003a002': [
-    (0xfa188c, 'e001c0d2', '0000bad2', 'virtual address region size: mov x0,#0xf00000000 (60 GB) → mov x0,#0xd0000000 (3.25 GB)', 'host-only'),
+    (0xfa188c, 'e001c0d2', '2000c0d2', 'virtual address region size: mov x0,#0xf00000000 (60 GB) → mov x0,#0x100000000 (4 GB)', 'host-only'),
     (0xf55010, 'e98340b2', 'e9ff9fd2', 'arena alloc check: mov x9,#0x1ffffffff → movz x9,#0xffff', 'host-only'),
-    (0xf55020, '4900a0f2', '4900a8f2', 'arena alloc check: movk x9,#2,lsl #16 → movk x9,#0x4002,lsl #16', 'host-only'),
-    (0xf55078, 'e97b5fb2', '2900a892', 'arena base adjust: mov x9,#-0x200000000 → movn x9,#0x4001,lsl #16', 'host-only'),
+    (0xf55020, '4900a0f2', '4900a6f2', 'arena alloc check: movk x9,#2,lsl #16 → movk x9,#0x3002,lsl #16', 'host-only'),
+    (0xf55078, 'e97b5fb2', '2900a692', 'arena base adjust: mov x9,#-0x200000000 → movn x9,#0x3001,lsl #16', 'host-only'),
     (0xf5507c, 'c9ffbff2', '090080f2', 'arena base adjust: movk x9,#0xfffe,lsl #16 → movk x9,#0,lsl #0', 'host-only'),
-    (0xf55084, '4800a0d2', '4800a8d2', 'arena capacity: mov x8,#0x20000 → movz x8,#0x4002,lsl #16', 'host-only'),
+    (0xf55084, '4800a0d2', '4800a6d2', 'arena capacity: mov x8,#0x20000 → movz x8,#0x3002,lsl #16', 'host-only'),
     (0xf55088, '2800c0f2', '1f2003d5', 'arena capacity: movk x8,#1,lsl #32 → nop', 'host-only'),
     (0xfa1b70, '1f0109eb', '09000014', 'allocator capacity check: cmp x8, x9 → b 0xfa1b94 (bypass artificial heap cap)', 'host-only'),
     (0xf56c94, 'a80240f9', '0800b4d2', 'RAM probe bypass: mov x8,#0xa0000000 (2.5 GB pool)', 'host-only'),
@@ -85,10 +89,14 @@ CUTS = {
     (0xd942b0, '01610039', '01590039', 'null check on singleton: strb w1, [x8, #0x16]', 'host-only'),
     (0xd942b4, '1f9101b8', '01610039', 'null check on singleton: strb w1, [x8, #0x18]', 'host-only'),
     (0xd942b8, '1fd10178', '1f2003d5', 'null check on singleton: nop', 'host-only'),
-    (0xf9bad0, 'e10300aa', 'c80200b4', 'allocator free: mov x1,x0 → cbz x8,0xf9bb28', 'host-only'),
-    (0xf9bad4, 'a80200b4', '7f0208eb', 'allocator free: cbz x8,0xf9bb28 → cmp x19,x8', 'host-only'),
-    (0xf9bad8, '68825ff8', '89020054', 'allocator free: ldur x8,[x19,#-8] → b.ls 0xf9bb28', 'host-only'),
-    (0xf9badc, '09054092', '0f000014', 'allocator free: and x9,x8,#3 → b 0xf9bb18', 'host-only'),
+    # Heap free (dlmalloc heap class, vtable 0x1772570 slot +0x40): operator delete also routes page-aligned blocks of another allocator here (first seen: 0x70803a0000 freed by the
+    # archive reader thread at boot); reading their chunk header at ptr-8 faults (main+0xf9bad8). Skip pointers at or below the heap's mspace [this+0x30] (this also covers ptr == 0),
+    # and keep the listener's onFree call for every real free (an earlier version of this cut skipped it for all frees: whatever tracks memory through the listener never saw a release
+    # and New Game stayed on its loading screen). The null-mspace check gives way: a heap is only freed into after it is set up
+    (0xf9bac8, '010300b4', '081840f9', 'heap free: cbz x1,skip → ldr x8,[x0,#0x30] (mspace)', 'host-only'),
+    (0xf9bacc, '081840f9', '7f0208eb', 'heap free: ldr x8,[x0,#0x30] → cmp x19,x8', 'host-only'),
+    (0xf9bad0, 'e10300aa', 'c9020054', 'heap free: mov x1,x0 → b.ls 0xf9bb28 (pointer at or below the mspace, or null: not this heap\'s, skip)', 'host-only'),
+    (0xf9bad4, 'a80200b4', 'e10300aa', 'heap free: cbz x8,skip → mov x1,x0 (the listener call that follows is unchanged)', 'host-only'),
     (0xb7fcf8, 'a02300d1', '611300b4', 'tutorial container null check: sub x0,x29,#8 → cbz x1,0xb7ff64', 'host-only'),
     (0xb7fcfc, '78890694', 'a1831ff8', 'tutorial container null check: bl 0xd222dc → stur x1,[x29,#-8]', 'host-only'),
     (0xb7fe90, 'a02300d1', '410300b4', 'tutorial container null check: sub x0,x29,#8 → cbz x1,0xb7fef8', 'host-only'),
@@ -289,6 +297,12 @@ OBS = {
   '60887a25b66529910275a1066003a002': [
     (0x550c30, 21, '7100041f', 'child state updated (x21 → entry {state object, ...}, w0 = result, 1 = done); orig cmp w0, #1'),
     (0x5505d4, 22, '7100041f', 'current state updated ([[x19+0x20]-0x10] = state object, w0 = result, 1 = done); orig cmp w0, #1'),
+    (0x502f94, 23, 'f9400bf3', 'sound handle still playing? (main+0x502f4c; x19 = handle {sound manager, u32 id}, w0 = 1 still playing; caller = [x29 + 8]); orig ldr x19, [sp, #0x10]'),
+    (0x2b3c30, 24, 'd102c3ff', 'event movie player update entry (x0 = player: +0x80 state 0 open / 1 opening / 2 playing / 3, +0x218 must be set before it opens, +0x220 name); orig sub sp, sp, #0xb0'),
+    (0x343d68, 25, 'd10503ff', 'movie request entry (x1 = request: +0x10 movie name, +0x34 / +0x38 flags; builds movie/%s.webm when both are 0); orig sub sp, sp, #0x140'),
+    (0x3e874, 26, 'a9bd7bfd', 'movie open entry (x0 = player, +0x40 must be set; x2 = path); orig stp x29, x30, [sp, #-0x30]!'),
+    (0xf558e8, 27, 'b94003fb', 'large-block allocation returned (main+0xf55fb4; x0 = block or 0, x27 = size class, x25 = size; caller of main+0xf542a0 = [x29 + 8]); orig ldr w27, [sp]'),
+    (0xf5585c, 28, '8b1b16c8', 'small-object allocation returned (main+0xf55a90; x0 = block or 0, x27 = size class, x25 = size); orig add x8, x22, x27, lsl #5'),
   ],
   'db0507f36b84200ac05f75d76ed5026f': [
     (0xb1dc60, 1, 'd10603ff', 'UI message bus virtual implementation entry (x1 = message {u64 type hash, u64 action hash, char* panel name, …}): '
