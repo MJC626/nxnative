@@ -5092,6 +5092,7 @@ static int first_draw_covers(int i, id<MTLTexture> t, NSUInteger level) {
 int nvn_dpool_base(const void *pool, int tex);   // hle_nvn.c: where a descriptor pool's IDs start in the host table
 // DrawTransformFeedback (Xenoblade Chronicles 3's characters): the game draws as many vertices as a capture wrote, the GPU taking the count from the capture's control buffer. The host keeps
 // each finished capture's bytes in buffer 0 and vertex count under its control buffer's address (End / Pause), and the draw becomes a plain array draw of that many vertices (tf_auto)
+static uint64_t g_rd_sets[2];   // SetRasterizerDiscard off / on replayed (rd_note)
 enum { TF_DONE = 32 };
 static struct { uint64_t ctl, bytes, verts; } g_tf_done[TF_DONE]; static int g_tf_ndone;
 static void tf_done_put(uint64_t ctl, uint64_t bytes, uint64_t verts) {
@@ -5163,7 +5164,7 @@ static int state_op(uint32_t op, const void *a) {
             if (b->what == 1 || b->what == 2) tf_done_put(b->ctl, S.tf_off[0], S.tf_verts);   // what DrawTransformFeedback with this control buffer draws (tf_auto)
             break; }
         case OP_PRIM_RESTART: S.restart = *(const p_prim_restart *)a; break;
-        case OP_RAST_DISCARD: S.rast_discard = ((const p_rast_discard *)a)->on; break;
+        case OP_RAST_DISCARD: S.rast_discard = ((const p_rast_discard *)a)->on; g_rd_sets[S.rast_discard != 0]++; break;
         default: return 0;
     }
     return 1;
@@ -6733,6 +6734,21 @@ static __unsafe_unretained id<MTLRenderPipelineState> tf_pso(NvShader *vs) {
 // Capture statistics (Xenoblade Chronicles 3's characters vanished once captures ran: are the right shaders captured, and what do they write?): per capturing vertex shader, captures,
 // vertices and draws skipped for no active capture; every 300 frames a line per shader with the first vertex's words at the last capture (read back from guest memory, so a frame late),
 // and at its first capture the words that were there before
+// Rasterizer discard (Xenoblade Chronicles 3's characters vanished once draws under discard were skipped, and showed again, through corruption, when discard was ignored): how often the game
+// turns it on / off, and which vertex shaders' draws are skipped under it, every 300 frames (rd_note). DM_NVN_RAST_DISCARD=0 skips only captures' rasterization: every other draw under
+// discard is drawn as before discard was implemented (a test)
+enum { RDST = 16 };
+static struct { char key[24]; uint64_t n; } g_rdst[RDST]; static int g_nrdst; static uint64_t g_rd_other;
+static int rd_ignore(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_RAST_DISCARD"); v = e && !strcmp(e, "0"); if (v) MLOG("DM_NVN_RAST_DISCARD=0: draws under rasterizer discard are drawn, except transform feedback captures (a test)"); } return v; }
+static void rd_note(NvShader *vs) {
+    const char *k = vs ? vs->key : "-"; int i = 0; while (i < g_nrdst && strcmp(g_rdst[i].key, k)) i++;
+    if (i < g_nrdst) g_rdst[i].n++; else if (g_nrdst < RDST) { snprintf(g_rdst[i].key, sizeof g_rdst[i].key, "%s", k); g_rdst[i].n = 1; g_nrdst++; } else g_rd_other++;
+    static uint64_t last; uint64_t f = atomic_load(&g_cur_frame);
+    if (f / 300 != last / 300) { last = f; char line[900]; int o = snprintf(line, sizeof line, "rasterizer discard up to frame %llu: set on %llu / off %llu times; draws skipped under it by vertex shader:", (unsigned long long)f, (unsigned long long)g_rd_sets[1], (unsigned long long)g_rd_sets[0]);
+        for (int j = 0; j < g_nrdst && o < (int)sizeof line - 48; j++) o += snprintf(line + o, sizeof line - o, " %s %llu", g_rdst[j].key, (unsigned long long)g_rdst[j].n);
+        if (g_rd_other) o += snprintf(line + o, sizeof line - o, " (others %llu)", (unsigned long long)g_rd_other);
+        MLOG("%s", line); }
+}
 enum { TFST = 32 };
 static struct { char key[24]; uint64_t caps, verts, off_skips, at; uint32_t words; } g_tfst[TFST]; static int g_ntfst;
 static void tf_words(const char *what, const char *key, uint64_t at, uint32_t n) {
@@ -6758,8 +6774,8 @@ static void tf_stat(NvShader *vs, int captured, const p_draw *dw, uint64_t at) {
 }
 static void tf_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
     __unsafe_unretained NvShader *vs = pr ? pr->sh[0] : nil;
-    if (!S.tf_on) { if (vs && vs->tf_fn) tf_stat(vs, 0, dw, 0); PD("Z %llu draw skipped: rasterizer discard", g_stat_pass + !g_enc); return; }
-    if (!vs || !vs->tf_fn) { RED_ONCE(100, "transform feedback with vertex shader %s, which has no capture entry point: nothing captured", vs ? vs->key : "-"); return; }
+    if (!S.tf_on) { if (vs && vs->tf_fn) tf_stat(vs, 0, dw, 0); rd_note(vs); PD("Z %llu draw skipped: rasterizer discard", g_stat_pass + !g_enc); return; }
+    if (!vs || !vs->tf_fn) { rd_note(vs); RED_ONCE(100, "transform feedback with vertex shader %s, which has no capture entry point: nothing captured", vs ? vs->key : "-"); return; }
     if (!dw || dw->ind || dw->mdi_cnt || dw->instances > 1 || dw->prim == 6 || dw->prim == 7) { RED_ONCE(101, "transform feedback draw that is indexed, indirect, instanced or a fan / quad list (vertex %s): not captured", vs->key); return; }
     if (dw->count <= 0) return;
     uint64_t gpu[4] = {0};
@@ -6914,7 +6930,10 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (!S.prog) { RED_ONCE(18, "no program bound before the draw"); PD("Z %llu draw skipped: no program bound", g_stat_pass + !g_enc); return; }
     __unsafe_unretained NvProg *pr = g_geo_program ? g_geo_program : prog_get(S.prog);
     draw_gs_check(pr);   // a geometry stage left with no function (see prog_fold_gs)
-    if (S.rast_discard) { tf_draw(pr, dw, di); return; }   // the vertex stage only: transform feedback capture, or nothing (tf_draw)
+    if (S.rast_discard) {   // the vertex stage only: transform feedback capture, or nothing (tf_draw); with DM_NVN_RAST_DISCARD=0 every other draw goes on, counted (rd_ignore)
+        if (!rd_ignore() || (S.tf_on && pr && pr->sh[0] && pr->sh[0]->tf_fn)) { tf_draw(pr, dw, di); return; }
+        rd_note(pr ? pr->sh[0] : nil);
+    }
     if (g_nubd && (g_enc || ubd_lazy()) && ubd_conflict(pr, dw, di)) { g_ubd_conflicts++; rp_end(); ubd_land(); }   // land the deferred inline updates before this draw (see ubd_conflict)
     if (zskip_can_draw(pr)) {   // Zero-source skip: the output is always 0, writing 0 over 0, so this draw changes no result (see zskip_can_draw)
         g_zskip_count++; { static int once; if (!once++) MLOG("zero-source skip: first case pass %llu", g_stat_pass + 1); }
