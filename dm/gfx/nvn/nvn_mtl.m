@@ -545,6 +545,9 @@ static vis_slot *g_vs; static int g_nvs, g_vscap;      // Slots since the last r
 static uint64_t g_cnt_report[32], g_cnt_reset[32];       // Report / reset counts per counter type (diagnostics)
 static _Atomic uint64_t g_sp_zero, g_sp_some, g_sp_nodraw, g_sp_skipped;   // samples-passed results (mtl_counter_report): 0 from counted draws / more than 0 / no draw since the reset / draws, none counted
 static uint32_t g_vq_try, g_vq_cnt;                        // draws since the samples-passed reset: issued / counted (reached the visibility slot)
+// Diagnostic DM_NVN_SAMPLES_MIN=n: every samples-passed report is at least n, written into guest memory when the report is replayed as well as when the GPU finishes, so a game that reads its
+// occlusion results without waiting (Xenoblade Chronicles 3: main+0xbb5c7c reads the other of two slots, no check that it landed) never sees 0: culling by them is off
+static uint64_t samples_min(void) { static long v = -1; if (v < 0) { const char *e = getenv("DM_NVN_SAMPLES_MIN"); v = e ? atol(e) : 0; if (v > 0) MLOG("DM_NVN_SAMPLES_MIN=%ld: occlusion query results are at least %ld", v, v); } return (uint64_t)v; }
 static void vis_clear(void) { for (int i = 0; i < g_nvs; i++) CFRelease(g_vs[i].buf); g_nvs = 0; g_vis_cur = -1; }
 static vis_list *vis_snapshot(void) {
     vis_list *l = malloc(sizeof *l + g_nvs * sizeof(vis_slot)); l->n = g_nvs;
@@ -1257,7 +1260,7 @@ uint64_t mtl_sub_commit(void) {
             else if (ops[i].kind == 3) {   // Samples passed: the sum of all slots since the reset
                 vis_list *l = ops[i].vis; uint64_t sum = 0;
                 for (int k = 0; k < l->n; k++) { sum += ((const uint64_t *)((__bridge id<MTLBuffer>)l->s[k].buf).contents)[l->s[k].slot]; CFRelease(l->s[k].buf); }
-                free(l); uint64_t rec[2] = {sum, gpu_ticks()}; memcpy((void *)ops[i].addr, rec, sizeof rec);
+                free(l); if (sum < samples_min()) sum = samples_min(); uint64_t rec[2] = {sum, gpu_ticks()}; memcpy((void *)ops[i].addr, rec, sizeof rec);
                 atomic_fetch_add(sum ? &g_sp_some : !ops[i].mode ? &g_sp_nodraw : !ops[i].v ? &g_sp_skipped : &g_sp_zero, 1);
             }
             else { uint64_t t = rep_ticks(&ops[i], sc, seg_last, c0, c1), rec[2] = {(ops[i].type == 0 || ops[i].type == 0x10) && !DM_GAME_RENDER_COND ? t : 0, t}; memcpy((void *)ops[i].addr, rec, sizeof rec); }   // render_cond: a timestamp report's counter field is 0, as on the GPU (see rc_value)
@@ -7978,7 +7981,8 @@ void mtl_exec(const uint8_t *p) {
             case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, (const uint8_t *)a + 8, 8); g_cnt_report[t & 31]++;
                 PD("Q report type=%llu cmd=%p dst=%#llx", (unsigned long long)t, p, (unsigned long long)ad);
                 if (DM_GAME_RENDER_COND) rc_note(ad, t == 0 || t == 0x10 ? 1 : 2);
-                if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) { post((post_op){3, NULL, g_vq_try, g_vq_cnt, ad, (uint32_t)t, vis_snapshot()}); g_vis_cur = -1; }   // mode / v: draws issued / counted since the reset
+                if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) { post((post_op){3, NULL, g_vq_try, g_vq_cnt, ad, (uint32_t)t, vis_snapshot()}); g_vis_cur = -1;   // mode / v: draws issued / counted since the reset
+                    if (samples_min() && nvn_host_readable(ad, 16)) { uint64_t rec[2] = {samples_min(), gpu_ticks()}; memcpy((void *)(uintptr_t)ad, rec, sizeof rec); } }
                 else mtl_sub_counter(ad, (uint32_t)t);
                 break; }
             case OP_RENDER_COND: { const p_render_cond *rc = a;   // recorded only with the profile key render_cond (hle_nvn.c)

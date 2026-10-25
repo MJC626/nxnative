@@ -125,7 +125,9 @@ static void front_ios_power_watch(void) {
     const char *sp = getenv("DM_SHOT_PASSDUMP"); long spn = sp ? atol(sp) : 0;
     if (spn > 0) {
         [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationUserDidTakeScreenshotNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
-            (void)n; void dm_gfx_passdump_next(long); static int shots; LOG("front end: screenshot %d (%.0f s after launch): passes of the next %ld frames dumped", ++shots, (now_ns() - g_t0_ns) / 1e9, spn); dm_gfx_passdump_next(spn); }];
+            (void)n; void dm_gfx_passdump_next(long); static int shots; static uint64_t last;   // iOS posts the notification twice for one screenshot
+            uint64_t t = now_ns(); if (last && t - last < 1000000000ull) return; last = t;
+            LOG("front end: screenshot %d (%.0f s after launch): passes of the next %ld frames dumped", ++shots, (t - g_t0_ns) / 1e9, spn); dm_gfx_passdump_next(spn); }];
         LOG("front end: a screenshot dumps the next %ld frames' passes (DM_SHOT_PASSDUMP)", spn);
     }
 }
