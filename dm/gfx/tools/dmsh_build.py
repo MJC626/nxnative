@@ -351,6 +351,14 @@ def tf_layout(key, ctl):
         out.append([[x - 0x20, n] for x, n in zip(locs, ns)] + [strides[b]])
     return out
 
+VS_STORE = re.compile(r'\(\*spvDescriptorSet0\.\w+_s\d+\)\.\w+\[[^\]]*\]\s*=(?!=)|\batomic_(?:fetch|store|exchange|compare)\w*\(|\.write\(')
+def vs_stores(src):
+    """A vertex shader that writes memory (storage buffers, atomics, images): drawn under rasterizer discard, its vertex stage is the whole point. Xenoblade Chronicles 3 skins its characters
+    so: points (one per vertex) with discard on, each invocation writing the skinned vertex into a storage buffer the character draws read. It gets a main0_tf entry point with no feedback
+    buffer (vs_tf with an empty layout), which the host runs with rasterization off (nvn_mtl.m tf_draw), so the points neither land in the frame's targets nor are skipped"""
+    m = re.search(r'\bvertex\s+main0_out\s+main0\s*\(', src)
+    return bool(m and VS_STORE.search(src[m.start():]))
+
 def vs_tf(src, tf):
     """The transform feedback entry point main0_tf: the main function's body, ending in stores of the captured outputs instead of returning them. Metal has no feedback stage; the host runs this
     vertex function with rasterization off and binds buffer b (the game's feedback buffer at its current offset, less first x stride) at TF_SLOT + b, so vertex v writes at v x stride.
@@ -499,7 +507,7 @@ def reflect(key, stage, msl, res):
             elif b and b['cb_slot'] >= 3:   # the address is in the game's own uniform buffer c[n] = uniform slot n - 3 (Monster Hunter Rise's compute shaders: c3 + 0x38); the replay reads it there
                 e.update(kind='sbuf_ubo', reg=b['cb_slot'] - 3, off=b['cb_offset'] * 4)
             else: e['reg'] = (off - base) // 16 if off is not None and base is not None and 0 <= off - base < 0x100 and (off - base) % 16 == 0 else None
-            e['rw'] = bool(b and b['flags'] & 2)
+            e['rw'] = bool(b and b['flags'] & 1)   # Ryujinx's BufferUsageFlags.Write is bit 0 (it was read as bit 1, so every storage buffer counted as read-only: no sbw_note / swrite_note for GPU writes)
     return binds
 
 DRV_FILL = {0: [(b, b + 0x100) for b in sorted(SSBO.values())],   # c0: storage buffer address tables (vertex / compute / pixel, 16 slots × 0x10 each)
@@ -838,6 +846,7 @@ def finish(key, w, j, c1):
         capture = dmsh_geometry.capture(src)
         src, full = vs_depth(src)
         full += capture
+        if not j.get('tf') and vs_stores(src): j['tf'] = [[], [], [], []]   # the vertex stage alone, for its memory writes (see vs_stores)
         if j.get('tf'): full += vs_tf(src, j['tf'])   # transform feedback capture (see vs_tf)
         plain = full
         full, lay = vs_layer_entry(full)   # layer entry points for a slice-writing geometry shader (see vs_layer_entry)

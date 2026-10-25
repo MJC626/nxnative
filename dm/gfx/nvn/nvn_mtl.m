@@ -6781,7 +6781,10 @@ static void tf_stat(NvShader *vs, int captured, const p_draw *dw, uint64_t at) {
 }
 static void tf_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
     __unsafe_unretained NvShader *vs = pr ? pr->sh[0] : nil;
-    if (!S.tf_on) { if (vs && vs->tf_fn) tf_stat(vs, 0, dw, 0); rd_note(vs); PD("Z %llu draw skipped: rasterizer discard", g_stat_pass + !g_enc); return; }
+    // A vertex shader that only writes memory (dmsh_build.py vs_stores: main0_tf with no feedback buffer; Xenoblade Chronicles 3's skinning into storage buffers) runs whether or not a
+    // capture is active: its writes are what the draw is for
+    int stores_only = vs && vs->tf_fn && !(vs->tf_stride[0] | vs->tf_stride[1] | vs->tf_stride[2] | vs->tf_stride[3]);
+    if (!S.tf_on && !stores_only) { if (vs && vs->tf_fn) tf_stat(vs, 0, dw, 0); rd_note(vs); PD("Z %llu draw skipped: rasterizer discard", g_stat_pass + !g_enc); return; }
     if (!vs || !vs->tf_fn) { rd_note(vs); RED_ONCE(100, "transform feedback with vertex shader %s, which has no capture entry point: nothing captured", vs ? vs->key : "-"); return; }
     if (!dw || dw->ind || dw->mdi_cnt || dw->instances > 1 || dw->prim == 6 || dw->prim == 7) { RED_ONCE(101, "transform feedback draw that is indexed, indirect, instanced or a fan / quad list (vertex %s): not captured", vs->key); return; }
     if (dw->count <= 0) return;
@@ -6809,12 +6812,13 @@ static void tf_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
         enc_r_vbuf(en, TF_SLOT + b, gpu[b] - (uint64_t)dw->first * vs->tf_stride[b]);
         uint64_t n = (uint64_t)dw->count * vs->tf_stride[b]; pend_add(S.tf[b].addr + S.tf_off[b], n, 4); S.tf_off[b] += n;
     }
-    S.tf_verts += (uint64_t)dw->count;
+    if (!stores_only) S.tf_verts += (uint64_t)dw->count;
     tf_stat(vs, 1, dw, S.tf[0].addr + S.tf_off[0] - (uint64_t)dw->count * vs->tf_stride[0]);
     enc_r_draw(en, MTLPrimitiveTypePoint, (NSUInteger)dw->first, (NSUInteger)dw->count);
     m4_end(en);
     args_dirty_all(); g_enc_pso = nil; g_enc_dss = nil; g_ed.ok = 0;
-    { static int once; if (!once++) MLOG("transform feedback: first capture (vertex %s, %d vertices)", vs->key, dw->count); }
+    { static int once[2]; if (!once[stores_only]++) { if (stores_only) MLOG("rasterizer discard: first draw run for its vertex stage's memory writes (vertex %s, %d vertices)", vs->key, dw->count);
+                                                      else MLOG("transform feedback: first capture (vertex %s, %d vertices)", vs->key, dw->count); } }
     PD("T %llu tf capture vs=%s first=%d count=%d written %llu/%llu/%llu/%llu", g_stat_pass, vs->key, dw->first, dw->count,
        (unsigned long long)S.tf_off[0], (unsigned long long)S.tf_off[1], (unsigned long long)S.tf_off[2], (unsigned long long)S.tf_off[3]);
 }
@@ -6938,7 +6942,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     __unsafe_unretained NvProg *pr = g_geo_program ? g_geo_program : prog_get(S.prog);
     draw_gs_check(pr);   // a geometry stage left with no function (see prog_fold_gs)
     if (S.rast_discard) {   // the vertex stage only: transform feedback capture, or nothing (tf_draw); with DM_NVN_RAST_DISCARD=0 every other draw goes on, counted (rd_ignore)
-        if (!rd_ignore() || (S.tf_on && pr && pr->sh[0] && pr->sh[0]->tf_fn)) { tf_draw(pr, dw, di); return; }
+        if (!rd_ignore() || (pr && pr->sh[0] && pr->sh[0]->tf_fn)) { tf_draw(pr, dw, di); return; }   // captures and memory-writing vertex stages (vs_stores) always run that way
         rd_note(pr ? pr->sh[0] : nil);
     }
     if (g_nubd && (g_enc || ubd_lazy()) && ubd_conflict(pr, dw, di)) { g_ubd_conflicts++; rp_end(); ubd_land(); }   // land the deferred inline updates before this draw (see ubd_conflict)
