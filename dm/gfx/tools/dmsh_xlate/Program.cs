@@ -7,7 +7,11 @@
 // Usage: dmsh_xlate <job.json> <output dir>
 //   Job: [{ "key", "stage": "vs|ps|cs", "code": machine code file (graphics = 0x50-byte SPH + instructions, compute = instructions),
 //           "tex": { "slot": "2d|2darray|cube|cubearray|3d|buffer|1d|1darray|2dms|2dmsarray", ... }, "img": { "slot": { "type", "fmt" } },
-//           "attr": { "location": "float|sint|uint" }, "fout": { "target": "float|sint|uint" }, "local": [x, y, z] }]
+//           "attr": { "location": "float|sint|uint" }, "fout": { "target": "float|sint|uint" }, "local": [x, y, z],
+//           "xfb": { "stride": bytes, "loc": [component locations] } (transform feedback buffer 0, read from the control section by dmsh_build.py) }]
+//   Transform feedback is emulated (Ryujinx's own fallback for hosts without it): the vertex shader stores its captured outputs into the storage buffer tfe_data0 at
+//   support_buffer.tfe_offset[0] + ((instance - base instance) * tfe_vertex_count + vertex - base vertex) * stride / 4 (words); the host binds the buffer and fills those fields per draw.
+//   Ryujinx declares tfe_data0..3 in descriptor set 1; they are moved into set 0 after the other bindings (MoveTfeToSet0), so SPIRV-Cross puts them in the one argument buffer
 //   Output: <key>.spv and <key>.res.json (offsets of storage buffer slots in c0, etc.; decoding texture handle → slot number is done in the script that builds the metallib)
 using Ryujinx.Common.Memory;
 using Ryujinx.Graphics.Shader;
@@ -15,6 +19,7 @@ using Ryujinx.Graphics.Shader.Translation;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -26,8 +31,22 @@ static class SwshXlate
     sealed class Accessor : IGpuAccessor
     {
         readonly byte[] _code; readonly JsonObject _job; int _binding = 1; public readonly List<string> Notes = new();
-        readonly byte[] _c1;
-        public Accessor(byte[] code, JsonObject job) { _code = code; _job = job; _c1 = job["c1"] is JsonNode h ? Convert.FromHexString((string)h) : Array.Empty<byte>(); }
+        readonly byte[] _c1, _xfbLoc; readonly int _xfbStride;
+        public int NextBinding => _binding;
+        public Accessor(byte[] code, JsonObject job)
+        {
+            _code = code; _job = job; _c1 = job["c1"] is JsonNode h ? Convert.FromHexString((string)h) : Array.Empty<byte>();
+            if (job["xfb"] is JsonObject x)
+            {
+                _xfbStride = (int)x["stride"]; _xfbLoc = x["loc"].AsArray().Select(n => (byte)(int)n).ToArray();
+                _binding = 4;   // the transform feedback buffers take storage buffer bindings 0..3 in the translator's own table: keep the game's buffers clear of them
+            }
+        }
+        // Transform feedback (job xfb): emulated with storage buffer stores, buffer 0 only
+        public bool QueryHostSupportsTransformFeedback() => false;
+        public bool QueryTransformFeedbackEnabled() => _xfbLoc != null;
+        public ReadOnlySpan<byte> QueryTransformFeedbackVaryingLocations(int bufferIndex) => bufferIndex == 0 && _xfbLoc != null ? _xfbLoc : ReadOnlySpan<byte>.Empty;
+        public int QueryTransformFeedbackStride(int bufferIndex) => bufferIndex == 0 ? _xfbStride : 0;
         // c1 constant segment (the 0x100 bytes before the control segment in the shader package): the jump table of indirect jump BRX lives here (LDC c[1]); without it the translator cannot resolve jump targets and control flow goes wrong (particle shaders loop forever)
         public uint ConstantBuffer1Read(int offset) { if (offset >= 0 && offset + 4 <= _c1.Length) return BitConverter.ToUInt32(_c1, offset); Notes.Add($"c1 read out of bounds +{offset:X} (c1 length {_c1.Length})"); return 0; }
         // All resources go into set 0, each with a distinct binding number (spirv-cross emits them as one argument buffer); the translator's convention of giving the buffer of constant segment number index binding = index+1 is not relied on
@@ -92,6 +111,25 @@ static class SwshXlate
         public bool QueryHostSupportsShaderFloat64() => !(_job["softfloat64"] is JsonNode n && (bool)n);
     }
 
+    // Transform feedback emulation: Ryujinx declares tfe_data0..3 in descriptor set 1, bindings 0..3; every other resource here is in set 0. Their decorations are rewritten to set 0,
+    // bindings first..first+3 (past the accessor's last binding), so SPIRV-Cross puts them in the same argument buffer under their own names
+    static byte[] MoveTfeToSet0(byte[] spirv, int first, List<string> notes)
+    {
+        uint[] w = new uint[spirv.Length / 4]; Buffer.BlockCopy(spirv, 0, w, 0, spirv.Length);
+        var set1 = new HashSet<uint>();
+        for (int i = 5; i < w.Length; i += Math.Max(1, (int)(w[i] >> 16)))
+            if ((w[i] & 0xffff) == 71 && w[i + 2] == 34 && w[i + 3] == 1) set1.Add(w[i + 1]);   // OpDecorate DescriptorSet 1
+        int moved = 0;
+        for (int i = 5; i < w.Length; i += Math.Max(1, (int)(w[i] >> 16)))
+        {
+            if ((w[i] & 0xffff) != 71 || !set1.Contains(w[i + 1])) continue;
+            if (w[i + 2] == 34) w[i + 3] = 0;
+            else if (w[i + 2] == 33) { if (w[i + 3] > 3) throw new InvalidOperationException($"set 1 binding {w[i + 3]} is not a transform feedback buffer"); w[i + 3] = (uint)first + w[i + 3]; moved++; }
+        }
+        notes.Add($"transform feedback emulated: {moved} buffers moved to set 0 from binding {first}");
+        byte[] o = new byte[spirv.Length]; Buffer.BlockCopy(w, 0, o, 0, o.Length); return o;
+    }
+
     // True when the SPIR-V declares a 64-bit float type (OpTypeFloat 64): SPIRV-Cross then writes double, which the Metal compiler rejects
     static bool UsesFloat64(byte[] spirv)
     {
@@ -132,7 +170,9 @@ static class SwshXlate
                     ctx = Translator.CreateContext(0, acc, new TranslationOptions(TargetLanguage.Spirv, TargetApi.Vulkan, flags));
                     p = ctx.Translate(); acc.Notes.Add("FP64 lowered to FP32 (DoubleToFloat)");
                 }
-                File.WriteAllBytes(Path.Combine(outDir, key + ".spv"), VertexCounterLowering.Apply(code, (string)job["stage"], p.BinaryCode, acc.Notes));
+                byte[] spv = VertexCounterLowering.Apply(code, (string)job["stage"], p.BinaryCode, acc.Notes);
+                if (job["xfb"] != null) spv = MoveTfeToSet0(spv, acc.NextBinding, acc.Notes);
+                File.WriteAllBytes(Path.Combine(outDir, key + ".spv"), spv);
                 var res = new JsonObject
                 {
                     ["key"] = key, ["stage"] = (string)job["stage"], ["notes"] = new JsonArray(acc.Notes.ConvertAll(n => (JsonNode)n).ToArray()),

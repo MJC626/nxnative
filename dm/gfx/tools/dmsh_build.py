@@ -253,6 +253,23 @@ def main_rec(mi, o):
     if g < 0 or mi[o:o + 4] != bytes.fromhex('34127698'): sys.exit(f'[RED] main image @{o:#x} is not the control section of an embedded shader (MAIN={MAIN})')
     return bytes(0x38) + mi[g:o + 0x880]
 
+def xfb_of(key, ctl):
+    """Transform feedback layout of buffer 0 in an NVN control section (Xenoblade Chronicles 3's skinning vertex shaders, 8 of 7,579): +0xdc one byte per captured output (0x20 + generic
+    attribute index), +0x4dc its component count (from .x), +0x6dc the stride in bytes, +0x6e8 the number of outputs; zero when the shader captures nothing. Checked on all 8: the components
+    add up to the stride and match the outputs the SPH writes. → {'stride', 'loc'}, loc being Ryujinx's per-word varying locations (attribute byte offset / 4), or None"""
+    n, stride = struct.unpack_from('<I', ctl, 0x6e8)[0], struct.unpack_from('<I', ctl, 0x6dc)[0]
+    if not n: return None
+    ids, comps = ctl[0xdc:0xdc + n], ctl[0x4dc:0x4dc + n]
+    loc = [0x20 + 4 * (a - 0x20) + c for a, k in zip(ids, comps) for c in range(k)]
+    if n > 32 or any(a < 0x20 or a >= 0x40 for a in ids) or any(not 1 <= k <= 4 for k in comps) or len(loc) * 4 != stride:
+        print(f'[RED] {key}: transform feedback layout not understood (outputs {ids.hex()}, components {comps.hex()}, stride {stride}): not captured', flush=True); return None
+    return {'stride': stride, 'loc': loc}
+
+def vs_xfb(src):
+    """A transform feedback vertex shader (job xfb) is drawn with the rasterizer off (SetRasterizerDiscard): its position is moved outside the clip volume, so nothing is rasterized while the
+    emulated capture (stores into tfe_data0, see dmsh_xlate/Program.cs) runs"""
+    return src.replace('return out;', 'out.gl_Position = float4(-4.0, -4.0, 0.0, 1.0);\n    return out;')
+
 def job_for(key, name, rec, w):
     ci = rec.find(bytes.fromhex('34127698')); code = rec[0x38:ci]; stage = stage_of.get(key, name[:2])
     c1o, c1t = struct.unpack_from('<2I', rec, ci + 0x700)   # control segment +0x700: c1 relative to the start of the instruction area, +0x704: total length of the instruction area (c1 = what lies between the two; lengths across the whole library are 0 / 256 / 512 / 768)
@@ -266,6 +283,7 @@ def job_for(key, name, rec, w):
     cp = os.path.join(w, key + '.bin'); open(cp, 'wb').write(code)
     j = {'key': key, 'stage': stage, 'code': cp, 'tex': {}, 'img': {}, 'attr': {}, 'fout': {}, 'c1': c1.hex(),
          'debug': os.environ.get('XLATE_DEBUG', '1') != '0', 'reduced': os.environ.get('XLATE_REDUCED', '1') == '1'}   # translation options (see dmsh_xlate/Program.cs); relaxed precision is on by default (GPU float last-bit error does not enter game state, whole frame −26% on the second Mac)   # c1: used by the translator to read indirect jump tables
+    if stage == 'vs' and (x := xfb_of(key, rec[ci:ci + 0x880])): j['xfb'] = x
     if key not in FACTS: j['pc_missing'] = True; return j, c1   # not in the answer table: queries use defaults (listed separately in the summary)
     j.update(FACTS[key])
     return j, c1
@@ -358,6 +376,7 @@ def reflect(key, stage, msl, res):
         ty, nm, aid = m.group(1).strip(), m.group(2), int(m.group(3))
         e = {'msl_name': nm, 'msl_type': ty, 'arg_id': aid}
         if nm == 'support_buffer': e.update(kind='support')
+        elif re.fullmatch(r'tfe_data(\d)', nm): e.update(kind='tfe', reg=int(nm[-1]))   # transform feedback capture buffer (dmsh_xlate/Program.cs MoveTfeToSet0)
         elif re.fullmatch(r'[a-z]+_c(\d+)', nm):
             n = int(re.fullmatch(r'[a-z]+_c(\d+)', nm).group(1))
             e.update(kind='cbuf', reg=n - 3) if 3 <= n <= 16 else e.update(kind='c1' if n == 1 else 'drvcb', bank=n)
@@ -561,6 +580,8 @@ def finish(key, w, j, c1):
     pad = []
     if j['stage'] == 'vs':   # outputs start as (0,0,0,1) (see vs_init)
         src = vs_init(src); open(msl, 'w').write(src)
+    if j.get('xfb'):   # transform feedback capture: nothing rasterized (see vs_xfb)
+        src = vs_xfb(src); open(msl, 'w').write(src)
     if j['stage'] == 'vs' and PAIRS.get(key):   # outputs the pixel shader reads but the vertex shader does not write get (0,0,0,1) (see vs_pad)
         src, pad = vs_pad(key, src)
         if pad: open(msl, 'w').write(src)
@@ -582,7 +603,7 @@ def finish(key, w, j, c1):
             'threadgroup_size': j.get('local'), 'c1': c1.hex(), 'notes': res['notes'] + (['no paired PC reflection, queries use defaults'] if j.get('pc_missing') else []), 'drv_reads': dr, 'drv_unfillable': unfillable(dr),
             'bindings': reflect(key, j['stage'], src, res),
             'vertex_inputs': [{'location': int(m.group(2)), 'msl_type': m.group(1)} for m in re.finditer(r'(\w+)\s+\w+\s*\[\[attribute\((\d+)\)\]\]', src)],
-            'raster': raster_facts(j['stage'], src), 'vs_pad': pad}
+            'raster': raster_facts(j['stage'], src), 'vs_pad': pad, **({'xfb_stride': j['xfb']['stride']} if j.get('xfb') else {})}
     write_refl(key, refl)
     fetch_finish(key, src, refl)
     return 'ok', '', refl

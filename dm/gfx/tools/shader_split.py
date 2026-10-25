@@ -16,6 +16,7 @@
 #       NV assembly text follows the first 0x880 bytes of the control section, and SASS disassembly text follows the code area. All 478 files hold "vertex, pixel" in pairs (1, 2 or 4 pairs), paired two by two in order
 #   · G2S (Koei Tecmo's KTGL, Hyrule Warriors: Age of Calamity): GLSLC compiler outputs inside the IDRK entries of the RDB data files (zlib in chunks), see idrk_shaders
 #   · SPKG (the older KTGL of Fire Emblem: Three Houses): shader packages of G2S containers, loose and inside the LINKDATA archive DATA0.bin / DATA1.bin, see kt_shaders and linkdata_jobs
+#   · Device dumps (profile key shader_dump, Xenoblade Chronicles 3): shaders the game builds or patches at load time, saved by the host on the device (DM_NVN_SHDUMP) into <version dir>/shader_dump, see dump_shaders
 #   · SDF (Capcom's RE Engine, Monster Hunter Rise): shader definitions inside the PAK archives (KPKA, entries zstd / deflate compressed), only the newest copy of each path, see kpka_jobs and sdf_shaders
 # Code area: 0x30 header + (graphics) 0x50 SPH + instructions; header magic 0x12345678 for graphics, 0x12345679 for compute. The control section starts with 0x98761234, +0x704 = code area length,
 #   +0x700 = start of the c1 constant segment within the code area; for compute +0x748 thread group xyz (u32 ×3), +0x754 shared memory bytes (checked one by one against PC reflection on D2R's 22 compute shaders).
@@ -38,6 +39,7 @@ SPCH_ALL = GAME.words('shader_spch_entries', '') == ['all']   # bf3.arh entries 
 SPCH_ENTRIES = [] if SPCH_ALL else [int(x) for x in GAME.words('shader_spch_entries', '')]
 GLSLC_ENTRIES = [int(x) for x in GAME.words('shader_glslc_entries', '')]   # bf3.arh entries holding GLSLC outputs (spch_shaders)
 CAPTURE = GAME.get('shader_glslc_capture', 'off') == 'on'   # GLSLC outputs the game compiles at run time, captured on the Mac (DM_GLSLC_CAPTURE, hle_glslc.c)
+DUMP = GAME.get('shader_dump', 'off') == 'on'   # shaders saved by the host on the device (DM_NVN_SHDUMP, nvn_mtl.m): dump_shaders
 
 CTL_MAGIC, GFX_MAGIC, CS_MAGIC = bytes.fromhex('34127698'), bytes.fromhex('78563412'), bytes.fromhex('79563412')
 STAGES = ['vs', 'hs', 'ds', 'gs', 'ps', 'cs']
@@ -265,6 +267,22 @@ def glslc_shaders(d, label, need=True):
         if not st or check(label, st, ctl, code): continue
         out.append((f'{label}#GLSLC@{h:#x}', st, ctl, code))
     if not out and need: red(f'{label}: the profile has shader_main_glslc on, but there is no GLSLC output')
+    return out
+
+def dump_shaders(d, label):
+    """Shaders the host saved on the device because they were missing from the map (DM_NVN_SHDUMP, nvn_mtl.m): <key>.ctl (the 0x880-byte control section) + <key>.code (the code area).
+    Xenoblade Chronicles 3 patches some GLSLC outputs of /effect/cmn_assets.wipac at load time (control and code both differ) and builds others that no container holds, so no scan of the game data
+    finds them; the dump holds exactly what the GPU gets. The file name must be the key"""
+    out = []
+    for nm in sorted(f for f in os.listdir(d) if f.endswith('.ctl')) if os.path.isdir(d) else []:
+        k = nm[:-4]
+        if not os.path.exists(os.path.join(d, k + '.code')): red(f'{label}/{nm}: no {k}.code beside it')
+        ctl, code = open(os.path.join(d, nm), 'rb').read(), open(os.path.join(d, k + '.code'), 'rb').read()
+        st = 'cs' if code[:4] == CS_MAGIC else SPH_STAGE.get((struct.unpack_from('<I', code, 0x30)[0] >> 10) & 0xf) if code[:4] == GFX_MAGIC and len(code) >= 0x34 else None
+        why = 'no stage in the code header' if not st else check(label, st, ctl, code)
+        if why: red(f'{label}/{k}: {why}')
+        if skey(ctl, code) != k: red(f'{label}/{k}: the file name is not the key of its contents ({skey(ctl, code)})')
+        out.append((f'{label}/{k}', st, ctl, code))
     return out
 
 IDRK, ZCHUNKED = b'IDRK0000', 0x100000
@@ -664,6 +682,13 @@ def main():
         for rel, uniq, pr, extra in again:
             if extra == 'defer': red(f'{rel}: Unity serialized file without type trees, and no bundle has a Shader type tree of the same hash to borrow')
         results = [r for r in results if r[3] != 'defer'] + again
+    if DUMP:   # last, so a key the game data also holds keeps its source there: <version dir>/shader_dump (beside RomFS), or DM_SHADER_DUMP
+        for i, romfs in enumerate(romfs_v):
+            tag = os.path.basename(os.path.dirname(os.path.abspath(romfs))) if i else ''
+            dd = os.environ.get('DM_SHADER_DUMP') or os.path.join(os.path.dirname(os.path.abspath(romfs)), 'shader_dump')
+            found = dump_shaders(dd, ('/' + tag if tag else '') + '/shader_dump')
+            if not found and not i: print(f'[RED] the profile has shader_dump on, but there are no dumped shaders in {dd}: the shaders the game patches at load time will have no translation', flush=True)
+            results.append(('dump', uniq_keys(found), set(), {}))
     per_src = collections.Counter(); pairs = set()
     for rel, uniq, pr, _ in results:
         pairs |= pr
@@ -695,7 +720,7 @@ def main():
     with open(mapout, 'w') as f:
         kinds = ' / '.join(k for k, hit in (('BNSH / BAHS', any('#BNSH@' in r[4] or '#BAHS@' in r[4] for r in rows)), ('Unity Shader', any('#var' in r[4] and '#BNSH@' not in r[4] and '#MSHD#' not in r[4] and '#SDF#' not in r[4] and '.wishp' not in r[4] for r in rows)),
                                             ('MSHD', any('#MSHD#' in r[4] for r in rows)), ('GLSLC', any('#GLSLC@' in r[4] for r in rows)), ('NVSD', any('#NVSD#' in r[4] for r in rows)), ('RE Engine SDF', any('#SDF#' in r[4] for r in rows)),
-                                            ('Monolith Soft SPCH', any('.wishp' in r[4] for r in rows))) if hit)
+                                            ('Monolith Soft SPCH', any('.wishp' in r[4] for r in rows)), ('device dump', any('/shader_dump/' in r[4] for r in rows))) if hit)
         f.write(f'# kind: evidence  {NOTE} ({kinds} in RomFS + main) → control section + code area keys (dm/gfx/tools/shader_split.py)\n')
         f.write('# column 5 records where each key first appears; this game has no PC version to pair with\n')
         f.write('package\tindex\tstage\tdm_ctl_sha16\tsource\n')

@@ -97,10 +97,29 @@ static void mv_open(const uint64_t *r) {
 }
 // Guest allocator results (OBS 27 / 28, Xenoblade Chronicles 3: the large-block and small-object paths of main+0xf55764): every failed allocation (first 200) with its size class, size and the
 // code that asked; every 10 s with the state report, counts of successes and failures. A loader stuck after reading a map's headers may be waiting for memory that never comes
+// Successful large blocks per size class (count, bytes, lowest / highest block address; frees are not seen, so bytes are what was handed out, not what is held), printed at the first
+// large failure: the 65 MB blocks (class 42) the opening movie asks for fail in a 4 GB region (docs/xenoblade3.md, memory layout), and this tells which classes took the space
+enum { AL_CLASSES = 64 };
+static _Atomic uint64_t g_al_cls_n[AL_CLASSES], g_al_cls_bytes[AL_CLASSES], g_al_cls_lo[AL_CLASSES], g_al_cls_hi[AL_CLASSES];
+static void al_note(const uint64_t *r) {
+    unsigned c = (unsigned)r[27]; if (c >= AL_CLASSES) return;
+    atomic_fetch_add(&g_al_cls_n[c], 1); atomic_fetch_add(&g_al_cls_bytes[c], r[25]);
+    uint64_t lo = atomic_load(&g_al_cls_lo[c]); while ((!lo || r[0] < lo) && !atomic_compare_exchange_weak(&g_al_cls_lo[c], &lo, r[0])) {}
+    uint64_t hi = atomic_load(&g_al_cls_hi[c]); while (r[0] > hi && !atomic_compare_exchange_weak(&g_al_cls_hi[c], &hi, r[0])) {}
+}
+static void al_table(void) {
+    uint64_t total = 0;
+    for (unsigned c = 0; c < AL_CLASSES; c++) if (g_al_cls_n[c]) {
+        total += g_al_cls_bytes[c];
+        LOG("state poll: large blocks of class %u so far: %llu, %.1f MB handed out, addresses %#llx..%#llx", c, (unsigned long long)g_al_cls_n[c], g_al_cls_bytes[c] / 1048576.0, (unsigned long long)g_al_cls_lo[c], (unsigned long long)g_al_cls_hi[c]);
+    }
+    LOG("state poll: large blocks handed out so far: %.1f MB in all", total / 1048576.0);
+}
 static void al_hit(const uint64_t *r, int large) {
     if (!sp_on()) return;
-    if (r[0]) { atomic_fetch_add(&g_al_ok[large], 1); return; }
+    if (r[0]) { atomic_fetch_add(&g_al_ok[large], 1); if (large) al_note(r); return; }
     uint64_t n = atomic_fetch_add(&g_al_fail[large], 1);
+    if (large && !n) al_table();
     if (n < 200) { uint64_t caller = 0; rd64(r[29] + 8, &caller); module_t *m = module_of((void *)caller); char cs[64];
         if (m) snprintf(cs, sizeof cs, "%s+%#llx", m->name, (unsigned long long)(caller - (uint64_t)m->base)); else snprintf(cs, sizeof cs, "%#llx", (unsigned long long)caller);
         LOG("[RED] guest allocation failed (%s): size class %llu, size %#llx, asked from %s", large ? "large block" : "small object", (unsigned long long)r[27], (unsigned long long)r[25], cs); }

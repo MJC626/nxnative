@@ -54,3 +54,7 @@ shader_separable	on
 shader_spch_entries	all
 # bf3.arh entries whose GLSLC compiler outputs are shaders: /effect/cmn_assets.wipac (1,362 outputs; 90 of the shaders the first field missed)
 shader_glslc_entries	53899
+# shaders no container holds: 35 load-time patches of cmn_assets.wipac's GLSLC outputs and 20 others, dumped by the host on the phone (DM_NVN_SHDUMP) and copied to <version dir>/shader_dump
+shader_dump	on
+# 79 of the 91 geometry shaders turn points into quads (4-vertex strips, mostly effects): drawn without the stage they give points of undefined size, so their draws are skipped
+gs_skip	on

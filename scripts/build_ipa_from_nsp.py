@@ -663,6 +663,12 @@ def glslc_wanted(g):   # the capture files the profile's shader map was built fr
     return set(re.findall(r'/glslc_capture/([0-9a-f]{16}\.glslc)#', t)) or None
 
 
+def dump_wanted(g):   # the device-dumped shaders the profile's shader map was built from (column 5: /shader_dump/<key>)
+    try: t = g.table('shader_map.tsv').read_text(errors='replace')
+    except OSError: return set()
+    return set(re.findall(r'\t/shader_dump/([0-9a-f]{16})$', t, re.M))
+
+
 def glslc_done(d):   # capture files written whole: a GLSLC output (magic 0x19866891) holds its own length at +0x44
     out = set()
     try: names = [n for n in os.listdir(d) if n.endswith('.glslc')]
@@ -880,7 +886,13 @@ def split_shaders(py, repo, roms, mains, pkg, env, logs, g, provisional=False):
     PROG.stage('shader split', step='checking the inputs')   # then a spinner: shader_split.py writes the package and the tables only at the end
     kf = pkg.with_name(pkg.name + '.key')
     key = None if provisional or ALLOW_DAMAGED else fingerprint(('files', tool_files(repo)), ('files', profile_files(g)),
-        *[x for r, m in zip(roms, mains) for x in (('files', [m]), ('tree', r), ('files', sorted((r.parent / 'glslc_capture').glob('*.glslc'))))])
+        *[x for r, m in zip(roms, mains) for x in (('files', [m]), ('tree', r), ('files', sorted((r.parent / 'glslc_capture').glob('*.glslc'))),
+                                                   ('files', sorted((r.parent / 'shader_dump').glob('*.c*'))))])
+    if not provisional and g.get('shader_dump', 'off') == 'on' and (want := dump_wanted(g)):
+        # shaders saved on the device (DM_NVN_SHDUMP): only the device can give them, so a missing one stops here with what to copy, not later as a table difference
+        lack = sorted(k for k in want if not (roms[0].parent / 'shader_dump' / f'{k}.ctl').is_file() or not (roms[0].parent / 'shader_dump' / f'{k}.code').is_file())
+        if lack: raise BuildError(f'{len(lack)} of the {len(want)} device-dumped shaders the profile\'s shader map names are missing from {roms[0].parent / "shader_dump"} '
+                                  f'(first {lack[0]}): copy the phone\'s Documents/shdump/*.ctl and *.code there')
     if key and pkg.is_dir() and (note := reused(kf, key)) is not None:
         PROG.end(f'{note}, reused (inputs unchanged)'); return key
     PROG.set(step='splitting')

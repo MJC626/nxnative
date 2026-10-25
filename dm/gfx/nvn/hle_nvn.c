@@ -721,6 +721,12 @@ NVN(nvnCommandBufferSignalEvent, void, NVNcommandBuffer *c, const NVNevent *e, N
     const ev_t *ev = (const ev_t *)e; volatile uint32_t *val = ev->val; uint32_t mm = m;
     memcpy(p + 8, &val, 8); memcpy(p + 16, &mm, 4); memcpy(p + 20, &v, 4);
 }
+// Fence in a command buffer: the sync is signalled once the GPU has completed everything before this point. The replay runs inside QueueSubmitCommands, so it gives the sync the fence value of
+// the submission that holds it (Xenoblade Chronicles 3, 34 calls a run)
+NVN(nvnCommandBufferFenceSync, void, NVNcommandBuffer *c, NVNsync *s, NVNsyncCondition cond, int flags) {
+    (void)cond; (void)flags;
+    uint8_t *p = cmd_alloc(CB(c), 16); put_hdr(p, OP_FENCE_SYNC, 16); memcpy(p + 8, &s, 8);
+}
 NVN(nvnCommandBufferResetCounter, void, NVNcommandBuffer *c, NVNcounterType t) {
     uint8_t *p = cmd_alloc(CB(c), 16); put_hdr(p, OP_RESET_COUNTER, 16); uint64_t tt = t; memcpy(p + 8, &tt, 8);
 }
@@ -792,6 +798,18 @@ static void clear_int(NVNcommandBuffer *c, int index, const int64_t v[4], int ma
 }
 NVN(nvnCommandBufferClearColori, void, NVNcommandBuffer *c, int index, const int *rgba, int mask) { int64_t v[4] = {rgba[0], rgba[1], rgba[2], rgba[3]}; clear_int(c, index, v, mask); }
 NVN(nvnCommandBufferClearColorui, void, NVNcommandBuffer *c, int index, const uint32_t *rgba, int mask) { int64_t v[4] = {rgba[0], rgba[1], rgba[2], rgba[3]}; clear_int(c, index, v, mask); }
+// Transform feedback (Xenoblade Chronicles 3 skins its characters with it: vertex shaders capture positions / normals into a buffer with the rasterizer off, later draws read that buffer).
+// Emulated: the capturing vertex shaders store their outputs themselves (dmsh_xlate/Program.cs); the replay binds the buffer, advances the capture position and draws DrawTransformFeedback
+// with the vertex count it captured (OP_XFB_* in nvn_mtl.m). Pause / Resume keep the position, as End / Begin with the same control buffer do there
+NVN(nvnCommandBufferBindTransformFeedbackBuffer, void, NVNcommandBuffer *c, int index, NVNbufferAddress a, size_t n) { *REC(c, OP_XFB_BIND, p_xfb) = (p_xfb){index, 0, a, n}; }
+NVN(nvnCommandBufferBindTransformFeedbackBuffers, void, NVNcommandBuffer *c, int first, int n, const NVNbufferRange *r) {
+    for (int i = 0; i < n; i++) *REC(c, OP_XFB_BIND, p_xfb) = (p_xfb){first + i, 0, r[i].address, r[i].size};
+}
+NVN(nvnCommandBufferBeginTransformFeedback, void, NVNcommandBuffer *c, NVNbufferAddress ctl) { *REC(c, OP_XFB_BEGIN, p_xfb) = (p_xfb){0, 0, ctl, 0}; }
+NVN(nvnCommandBufferResumeTransformFeedback, void, NVNcommandBuffer *c, NVNbufferAddress ctl) { *REC(c, OP_XFB_BEGIN, p_xfb) = (p_xfb){0, 1, ctl, 0}; }
+NVN(nvnCommandBufferEndTransformFeedback, void, NVNcommandBuffer *c, NVNbufferAddress ctl) { *REC(c, OP_XFB_END, p_xfb) = (p_xfb){0, 0, ctl, 0}; }
+NVN(nvnCommandBufferPauseTransformFeedback, void, NVNcommandBuffer *c, NVNbufferAddress ctl) { *REC(c, OP_XFB_END, p_xfb) = (p_xfb){0, 1, ctl, 0}; }
+NVN(nvnCommandBufferDrawTransformFeedback, void, NVNcommandBuffer *c, NVNdrawPrimitive mode, NVNbufferAddress ctl) { *REC(c, OP_XFB_DRAW, p_xfb) = (p_xfb){0, (int32_t)mode, ctl, 0}; }
 NVN(nvnCommandBufferClearDepthStencil, void, NVNcommandBuffer *c, float depth, uint32_t dmask, int stencil, int smask) {
     p_clear_ds *r = REC(c, OP_CLEAR_DS, p_clear_ds); *r = (p_clear_ds){depth, (int)B(dmask), stencil, smask};
 }
@@ -1984,7 +2002,9 @@ NVN(nvnCommandBufferSetAlphaRef, void, NVNcommandBuffer *c, float r) { (void)c; 
 NVN(nvnCommandBufferSetLineWidth, void, NVNcommandBuffer *c, float w) { (void)c; if (w != 1.0f) ONCE_LOG("SetLineWidth %.2f: Metal has only 1-pixel lines", w); }
 NVN(nvnCommandBufferSetPointSize, void, NVNcommandBuffer *c, float s) { (void)c; (void)s; ONCE_LOG("SetPointSize: the point size comes from the shader"); }
 NVN(nvnCommandBufferSetPrimitiveRestart, void, NVNcommandBuffer *c, uint32_t en, int idx) { (void)c; if ((en & 0xff) && idx != -1 && idx != 0xffff) ONCE_LOG("[RED] SetPrimitiveRestart index %#x: Metal only accepts all ones", idx); }
-NVN(nvnCommandBufferSetRasterizerDiscard, void, NVNcommandBuffer *c, uint32_t en) { (void)c; if (en & 0xff) ONCE_LOG("[RED] SetRasterizerDiscard on: ignored by the host for now"); }
+// Rasterizer discard (Xenoblade Chronicles 3 turns it on around its transform feedback draws): the replay skips draws while it is on. Rasterized, those draws painted their vertices into whatever
+// targets were bound; what they should capture is not written yet (transform feedback is not implemented)
+NVN(nvnCommandBufferSetRasterizerDiscard, void, NVNcommandBuffer *c, uint32_t en) { uint8_t *p = cmd_alloc(CB(c), 16); put_hdr(p, OP_RASTER_DISCARD, 16); uint32_t on = (en & 0xff) != 0; memcpy(p + 8, &on, 4); }
 NVN(nvnCommandBufferSetSampleMask, void, NVNcommandBuffer *c, int m) { (void)c; if ((m & 0xffff) != 0xffff) ONCE_LOG("SetSampleMask %#x: ignored by the host for now", m); }
 NVN(nvnCommandBufferSetConservativeRasterEnable, void, NVNcommandBuffer *c, uint32_t en) { (void)c; if (en & 0xff) ONCE_LOG("SetConservativeRasterEnable on: ignored by the host for now"); }
 NVN(nvnCommandBufferSetTiledCacheAction, void, NVNcommandBuffer *c, NVNtiledCacheAction a) { (void)c; (void)a; }        // Tegra tiled cache hint, no Metal equivalent

@@ -465,6 +465,20 @@ typedef struct seg_clk seg_clk; static seg_clk *g_sclk; static void seg_clk_put(
 // (that happens when the GPU completes): a timestamp one counts with its known counter 0; a samples-passed result (an occlusion query, written from the visibility buffers) is
 // unknown, and a condition on it keeps drawing, as before (occlusion culling only saves work). Inside a block evaluated false, draws and clears are dropped
 static int g_rc_skip;   // a render-enable block evaluated false is active
+static uint64_t g_gs_skips;   // draws skipped for a geometry stage (draw)
+// Transform feedback, emulated (hle_nvn.c, dmsh_xlate/Program.cs): the buffers BindTransformFeedbackBuffer set, whether a capture is running and its position in buffer 0 (bytes; queue state,
+// kept across submissions). End / Pause store the position under the control buffer's address (Resume and DrawTransformFeedback read it back). g_xfb_draw: the draw being encoded captures,
+// at word g_xfb_off of buffer 0 with g_xfb_vcnt vertices per instance (support_buffer tfe_offset[0] / tfe_vertex_count)
+static struct { struct { uint64_t addr, size; } b[4]; int active; uint64_t pos; } g_xfb;
+enum { XFB_DONE = 32 }; static struct { uint64_t ctl, bytes; } g_xfb_done[XFB_DONE]; static int g_xfb_ndone;
+static int g_xfb_draw; static int32_t g_xfb_off, g_xfb_vcnt; static uint64_t g_xfb_draws, g_xfb_verts;
+static uint64_t xfb_get(uint64_t ctl) { for (int i = 0; i < g_xfb_ndone; i++) if (g_xfb_done[i].ctl == ctl) return g_xfb_done[i].bytes; return 0; }
+static void xfb_put(uint64_t ctl, uint64_t bytes) {
+    for (int i = 0; i < g_xfb_ndone; i++) if (g_xfb_done[i].ctl == ctl) { g_xfb_done[i].bytes = bytes; return; }
+    if (g_xfb_ndone == XFB_DONE) { memmove(g_xfb_done, g_xfb_done + 1, sizeof g_xfb_done[0] * (XFB_DONE - 1)); g_xfb_ndone--; }
+    g_xfb_done[g_xfb_ndone++] = (typeof(g_xfb_done[0])){ctl, bytes};
+}
+static int g_rd_skip; static uint64_t g_rd_draws;   // rasterizer discard on (OP_RASTER_DISCARD; queue state, kept across submissions): draws skipped, and how many so far
 #define RC_PEND 256
 static struct { uint64_t addr; int kind; } g_rc_pend[RC_PEND]; static int g_rc_npend;   // reports replayed in this submission: kind 1 = timestamp (counter 0), 2 = another counter (unknown)
 static uint64_t g_rc_occ[4096];   // addresses ever written by a non-timestamp report (open addressing): conditions on them keep drawing
@@ -2432,7 +2446,7 @@ static void shmap_load(void) {
 - (void)dealloc { free(rf.c1); }
 @end
 #include "nvn_pso_skey.h"
-@interface NvProg : NSObject { @public NvShader *sh[6]; } @end
+@interface NvProg : NSObject { @public NvShader *sh[6]; int gs_lost; } @end   // gs_lost: a geometry stage is bound that the host cannot run (Metal has none): its draws are skipped (draw)
 @implementation NvProg @end
 // Warm-up entry: built in the background, waiting to be taken by the submit thread. vs / fs are strong references (in pso they are only raw pointers, and the background dictionary is released when the task ends)
 @interface WarmItem : NSObject { @public int kind; NSString *key, *vs_key, *fs_key; NvShader *shader, *vs, *fs; pso_key pso; id<MTLFunction> fsfn; id object; } @end
@@ -2665,6 +2679,8 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // Called only
         if (!stage) {   // Not in the package: look up the compute kernels embedded in the main body (nvn_builtin.h)
             NvShader *b = builtin_get(k.UTF8String);
             if (b) { o->sh[5] = b; continue; }
+            { uint32_t w[2]; const uint8_t *code = (const uint8_t *)(uintptr_t)p->sd[i].data;   // a geometry shader (SPH word 0 bits 10..13 = 4 after a graphics code header) counts as lost too
+              if (code) { memcpy(w, code, 4); memcpy(w + 1, code + 0x30, 4); if (w[0] == 0x12345678 && (w[1] >> 10 & 0xf) == 4) o->gs_lost = 1; } }
             MLOG("[RED] shader %s is not in the shader map (DM_NVN_SHDUMP=directory saves its control section and code area)", k.UTF8String);
             // DM_NVN_SHDUMP=directory: shaders missing from the map are saved as <key>.ctl (0x880-byte control section) and <key>.code (code area, length from control +0x704), to trace their source / add them to the map offline
             static const char *shd; static int shd_init; if (!shd_init) { shd = getenv("DM_NVN_SHDUMP"); shd_init = 1; }
@@ -2675,6 +2691,7 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // Called only
             continue;
         }
         int st = stage_of(stage);
+        if ([stage isEqualToString:@"geometry"]) { o->gs_lost = 1; static int once; if (!once++) MLOG("[RED] geometry shader %s: Metal has no geometry stage, the draws that use one are %s (first case)", k.UTF8String, DM_GAME_GS_SKIP ? "skipped" : "drawn without it"); continue; }
         NvShader *sh = st >= 0 ? shader_get([k stringByAppendingString:@"_b"], st) : nil;
         if (sh) o->sh[st] = sh; else MLOG("[RED] shader %s (%s) failed to load: build the shaders with dm/gfx/tools/dmsh_build.py first", k.UTF8String, stage.UTF8String);
     }
@@ -2980,7 +2997,7 @@ static const prog_t *bind_stages(const prog_t *p, int stages) {
     int i = ncp < NCMP ? ncp++ : next++ % NCMP;
     if (cp[i].serial) serial_del(cp[i].serial);
     NvProg *o = [NvProg new];
-    for (int st = 0; st < 5; st++) { ck[i][st] = S.bst[st]; cs[i][st] = S.bst[st] ? S.bst[st]->serial : 0; if (S.bst[st]) { __unsafe_unretained NvProg *src = prog_get(S.bst[st]); o->sh[st] = src ? src->sh[st] : nil; } }
+    for (int st = 0; st < 5; st++) { ck[i][st] = S.bst[st]; cs[i][st] = S.bst[st] ? S.bst[st]->serial : 0; if (S.bst[st]) { __unsafe_unretained NvProg *src = prog_get(S.bst[st]); o->sh[st] = src ? src->sh[st] : nil; if (st == 2 && src && src->gs_lost) o->gs_lost = 1; } }
     memset(&cp[i], 0, sizeof cp[i]); cp[i].magic = MAGIC('P', 'R', 'O', 'G'); cp[i].serial = nvn_new_serial(); serial_put(cp[i].serial, o);
     { static int once; if (!once++) MLOG("per-stage program binding: first combined program (vertex %s fragment %s)", o->sh[0] ? o->sh[0]->key : "-", o->sh[1] ? o->sh[1]->key : "-"); }
     return &cp[i];
@@ -3756,8 +3773,16 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             slots[aid] = (sh->c1buf ? sh->c1_gpu : zero_bank_gpu()) + (sh->c1buf ? sh->c1off : 0);
             USE(cb, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_SUPPORT) {   // support_buffer: scale 1.0, BGRA swap 0, viewport transform not disabled (viewport fields are not read)
-            slots[aid] = support_gpu();
-            USE(support_buf(), MTLResourceUsageRead);
+            if (g_xfb_draw && metal_vertex) {   // a transform feedback capture: a copy with tfe_offset[0] (+1360) and tfe_vertex_count (+1376) for this draw (MSL layout of SupportBuffer.cs)
+                id<MTLBuffer> db; size_t doff = arena_alloc(1392, &db); uint8_t *d = (uint8_t *)db.contents + doff;
+                memcpy(d, support_buf().contents, 1392); int32_t o4[4] = {g_xfb_off, 0, 0, 0}; memcpy(d + 1360, o4, 16); memcpy(d + 1376, &g_xfb_vcnt, 4);
+                slots[aid] = g_cur_arena->gpu + doff; USE(db, MTLResourceUsageRead);
+            } else { slots[aid] = support_gpu(); USE(support_buf(), MTLResourceUsageRead); }
+        } else if (b->kind == NVN_RB_TFE) {   // transform feedback capture buffer (only buffer 0 is captured; the others are declared but never written)
+            void *mb; uint64_t mo, gpu; const uint64_t ba = reg < 4 ? g_xfb.b[reg].addr : 0, bn = reg < 4 ? g_xfb.b[reg].size : 0;
+            if (g_xfb_draw && ba && mtl_gpu_addr(ba, bn ? bn : 1, &mb, &mo, &gpu)) { use_rec("buf", ba, bn, 0, NULL); slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, MTLResourceUsageRead | MTLResourceUsageWrite); }
+            else { slots[aid] = dummy_buf_gpu(); USE(dummy_buf(), MTLResourceUsageRead); }
+            if (bl) PD("B %llu st%d tfe%d addr=%#llx size=%llu %s", g_stat_pass, nvn_stage, reg, (unsigned long long)ba, (unsigned long long)bn, g_xfb_draw ? "capture" : "not capturing");
         } else if (b->kind == NVN_RB_DRV0 || b->kind == NVN_RB_DRV2) {
             // NVN driver constant segments: those proven unread by static analysis at packaging time are supplied as 0; those read are filled on the spot from the current bindings - c0 = storage buffer table (base + 0x10 r: address 64 bits, size 32 bits),
             // c2 = texture handle table (0x168 + 8 r) and sampler handle table (0x568 + 8 r), the values being the NVN handles the game gave at bind time; positions read outside the tables are registered at packaging time and reported a failure at load time
@@ -5602,16 +5627,41 @@ static int mdi_live(uint64_t cnt, int i) {
     }
     return (uint32_t)i < g_mdi_count;
 }
+// Transform feedback capture (see g_xfb): the bound vertex shader writes tfe_data0 (dmsh_build.py xfb_of), its stride in bytes, or 0
+static int xfb_stride_of(__unsafe_unretained NvProg *pr) { return pr && pr->sh[0] ? pr->sh[0]->rf.xfb_stride : 0; }
+static int xfb_capturing(void) { return g_xfb.active && S.prog && xfb_stride_of(prog_get(S.prog)); }
+// Before a capturing draw is encoded: where its vertices go (support_buffer tfe_offset[0] in words, tfe_vertex_count), and the capture position moves past them. The shader writes vertex v of
+// instance i at tfe_offset + ((i - base instance) * tfe_vertex_count + vertex_id - base_vertex) * stride / 4: for a non-indexed draw Metal's base_vertex is 0 and vertex_id counts from first,
+// so first is taken off the offset. 0 when the draw must not run (its count is only on the GPU, or it would write past the buffer)
+static int xfb_prepare(const p_draw *dw, const p_draw_idx *di, int xs) {
+    if ((dw && dw->ind) || (di && di->ind)) { RED_ONCE(97, "transform feedback capture with an indirect draw: its vertex count is not known on the CPU, not drawn"); return 0; }
+    int64_t n = dw ? dw->count : di->count, inst = MAX(dw ? dw->instances : di->instances, 1), first = dw ? dw->first : 0;
+    uint64_t need = (uint64_t)(n * inst) * (uint64_t)xs;
+    if (!g_xfb.b[0].addr || g_xfb.pos + need > g_xfb.b[0].size) {
+        { static int once; if (!once++) MLOG("[RED] transform feedback capture past its buffer (position %llu + %llu bytes, buffer %llu bytes at %#llx): not drawn (first case)", (unsigned long long)g_xfb.pos, (unsigned long long)need, (unsigned long long)g_xfb.b[0].size, (unsigned long long)g_xfb.b[0].addr); }
+        return 0;
+    }
+    g_xfb_off = (int32_t)(g_xfb.pos / 4 - first * xs / 4); g_xfb_vcnt = (int32_t)n; g_xfb.pos += need; g_xfb_draw = 1; g_xfb_draws++; g_xfb_verts += (uint64_t)(n * inst);
+    args_dirty_all();   // the support buffer copy and the capture buffer differ per draw
+    PD("Y %llu xfb capture %lld vertices x%lld at word %d (stride %d)%s", g_stat_pass + !g_enc, (long long)n, (long long)inst, g_xfb_off, xs, di ? " indexed: written at the index values" : "");
+    return 1;
+}
 static void draw(const p_draw *dw, const p_draw_idx *di) {
+    g_xfb_draw = 0;
     if ((di && di->mdi_cnt && !mdi_live(di->mdi_cnt, di->mdi_i)) || (dw && dw->mdi_cnt && !mdi_live(dw->mdi_cnt, dw->mdi_i))) return;   // past the multi-draw's count
     if (!S.prog) { RED_ONCE(18, "no program bound before the draw"); PD("Z %llu draw skipped: no program bound", g_stat_pass + !g_enc); return; }
     __unsafe_unretained NvProg *pr = prog_get(S.prog);
+    // A geometry stage the host cannot run (profile key gs_skip): 79 of Xenoblade Chronicles 3's 91 are point-to-quad expansions (triangle strips of 4 vertices: effects, /effect/cmn_assets.wipac),
+    // so the draw without it gives single points of undefined size, not the picture; skipped until geometry shaders are emulated. Without the key such draws go on without the stage, as before
+    if (DM_GAME_GS_SKIP && pr && pr->gs_lost) { g_gs_skips++; PD("Z %llu draw skipped: geometry stage", g_stat_pass + !g_enc); return; }
+    int xs = xfb_stride_of(pr);   // a capturing vertex shader rasterizes nothing (dmsh_build.py vs_xfb): outside a capture its draw does nothing
+    if (xs && !g_xfb.active) { PD("Z %llu draw skipped: transform feedback shader outside a capture", g_stat_pass + !g_enc); return; }
     if (g_nubd && g_enc && ubd_conflict(pr, dw, di)) { g_ubd_conflicts++; rp_end(); }   // land the deferred inline updates before this draw (see ubd_conflict)
     if (g_ruler_truth == 0) {   // Ruler negative control (DM_NVN_RULER_NEG=<fragment key>): in the mode under test drop this shader's draws, and the ruler must report non-equivalence
         static const char *neg; static int ng = -1; if (ng < 0) { neg = getenv("DM_NVN_RULER_NEG"); ng = neg && *neg; }
         if (ng && pr) for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (sh && sh->stage == 1 && !strncmp(sh->key, neg, strlen(neg))) { static int once; if (!once++) MLOG("DM_NVN_RULER_NEG: the mode under test drops the draws of shader %s", sh->key); return; } }
     }
-    if (zskip_can_draw(pr)) {   // Zero-source skip: the output is always 0, writing 0 over 0, so this draw changes no result (see zskip_can_draw)
+    if (!xs && zskip_can_draw(pr)) {   // Zero-source skip: the output is always 0, writing 0 over 0, so this draw changes no result (see zskip_can_draw)
         g_zskip_count++; { static int once; if (!once++) MLOG("zero-source skip: first case pass %llu", g_stat_pass + 1); }
         PD("N %llu zero-source draw skipped", g_stat_pass + 1); return; }
     if (ixc_wanted(dw, di) && !ixc_find(dw, di)) ixc_run(dw, di);   // indirect quads / fans / 8-bit indices: converted on the GPU before the render pass, at their own place in the replay (see ixc_run)
@@ -5619,6 +5669,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (!g_defer_replaying) {
         if (g_defer.active && g_defer.in_p && !g_defer.at_q) { if (defer_take(dw, di)) return; }
     }
+    if (xs && !xfb_prepare(dw, di, xs)) return;
     // Draws that cannot draw anything (both faces culled, empty scissor) return before the render pass is opened: otherwise the render pass is already open and on TBDR the whole attachment is loaded and stored for nothing
     // (Mac character select page: 3 render passes are opened only because of such draws, all loaded, zero draws)
     // Diagnostic switch for measuring an upper bound DM_NVN_SKIP_FS=<fragment key>[,<fragment key>...] (none by default): drops all draws of these fragment shaders (the picture will be wrong; only used in real-device ABA to measure "how much GPU time this class of draws is worth in total")
@@ -6722,6 +6773,9 @@ void mtl_exec(const uint8_t *p) {
                 mtl_exec((const uint8_t *)t); g_ret_n--; break; }
             case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, (const uint8_t *)a + 8, 4); memcpy(&v, (const uint8_t *)a + 12, 4);
                 PD("Y signal_event cmd=%p dst=%p mode=%u value=%u", p, val, m, v); mtl_sub_event(val, m, v); break; }
+            case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8);   // CommandBufferFenceSync: complete with this submission (committed as g_fence + 1 at mtl_sub_commit); fence before the flag, other threads wait on it
+                if (s && s->magic == MAGIC('S', 'Y', 'N', 'C')) { __atomic_store_n(&s->fence, g_fence + 1, __ATOMIC_RELEASE); __atomic_store_n(&s->fenced, 1, __ATOMIC_RELEASE); }
+                PD("Y fence_sync cmd=%p sync=%p fence=%llu", p, (void *)s, (unsigned long long)(g_fence + 1)); break; }
             case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, (const uint8_t *)a + 8, 8); g_cnt_report[t & 31]++;
                 PD("Q report type=%llu cmd=%p dst=%#llx", (unsigned long long)t, p, (unsigned long long)ad);
                 if (DM_GAME_RENDER_COND) rc_note(ad, t == 0 || t == 0x10 ? 1 : 2);
@@ -6796,8 +6850,29 @@ void mtl_exec(const uint8_t *p) {
                 PD("c %llu depth-stencil clear recorded ser=%llu depth=%g depth_mask=%d stencil=%d stencil_mask=%#x", g_stat_pass, R.rt.depth ? (unsigned long long)R.rt.depth->serial : 0ull, c->depth, c->depth_mask, c->stencil, c->stencil_mask);
                 break;
             }
-            case OP_DRAW: if (g_rc_skip) break; g_exec_next = p + h.size; draw(a, NULL); g_exec_next = NULL; break;   // Lookahead start point
-            case OP_DRAW_IDX: if (g_rc_skip) break; g_exec_next = p + h.size; draw(NULL, a); g_exec_next = NULL; break;
+            case OP_XFB_BIND: { const p_xfb *x = a; if (x->index >= 0 && x->index < 4) { g_xfb.b[x->index].addr = x->addr; g_xfb.b[x->index].size = x->size; }
+                PD("Y xfb bind %d addr=%#llx size=%llu", x->index, (unsigned long long)x->addr, (unsigned long long)x->size); break; }
+            case OP_XFB_BEGIN: { const p_xfb *x = a; g_xfb.active = 1; g_xfb.pos = x->mode ? xfb_get(x->addr) : 0;
+                { static int once; if (!once++) MLOG("transform feedback: first capture (buffer 0 at %#llx, %llu bytes); emulated by the capturing vertex shaders", (unsigned long long)g_xfb.b[0].addr, (unsigned long long)g_xfb.b[0].size); }
+                PD("Y xfb %s ctl=%#llx pos=%llu", x->mode ? "resume" : "begin", (unsigned long long)x->addr, (unsigned long long)g_xfb.pos); break; }
+            case OP_XFB_END: { const p_xfb *x = a; g_xfb.active = 0; xfb_put(x->addr, g_xfb.pos);
+                PD("Y xfb %s ctl=%#llx bytes=%llu", x->mode ? "pause" : "end", (unsigned long long)x->addr, (unsigned long long)g_xfb.pos);
+                // Metal 4 does not order a vertex-stage store before a later vertex fetch of the same buffer: the captured data are read by draws after this, so the pass ends here
+                // and the next one starts with the full barrier
+                if (!x->mode) { if (g_enc) rp_end(); g_game_barrier = 1; }
+                break; }
+            case OP_XFB_DRAW: { const p_xfb *x = a; if (g_rc_skip) break; if (g_rd_skip) { g_rd_draws++; break; }
+                uint64_t bytes = xfb_get(x->addr); int vs_ = S.attr[0].stream < 16 ? S.attr[0].stream : 0; uint32_t st = S.stream[vs_].stride;   // the stream attribute 0 reads (the captured buffer)
+                if (!st) { RED_ONCE(98, "DrawTransformFeedback with no stride on the vertex stream attribute 0 reads: not drawn"); break; }
+                p_draw d = {x->mode, 0, (int32_t)(bytes / st), 1, 0, 0, 0, 0, 0};
+                PD("Y xfb draw ctl=%#llx bytes=%llu stride=%u → %d vertices", (unsigned long long)x->addr, (unsigned long long)bytes, st, d.count);
+                if (d.count > 0) { g_exec_next = p + h.size; draw(&d, NULL); g_exec_next = NULL; }
+                break; }
+            case OP_RASTER_DISCARD: { uint32_t on; memcpy(&on, a, 4); g_rd_skip = on != 0; PD("E %llu rasterizer discard %u", g_stat_pass, on);
+                if (on) { static int once; if (!once++) MLOG("SetRasterizerDiscard on: draws are skipped while it is on, except transform feedback captures (their shaders rasterize nothing)"); }
+                break; }
+            case OP_DRAW: if (g_rc_skip) break; if (g_rd_skip && !xfb_capturing()) { g_rd_draws++; break; } g_exec_next = p + h.size; draw(a, NULL); g_exec_next = NULL; break;   // Lookahead start point
+            case OP_DRAW_IDX: if (g_rc_skip) break; if (g_rd_skip && !xfb_capturing()) { g_rd_draws++; break; } g_exec_next = p + h.size; draw(NULL, a); g_exec_next = NULL; break;
             // Do not mark dirty if the state did not change (the game often re-sends the same program / state block / vertex format before each draw; the dirty flag only decides whether to re-fetch the pipeline / depth-stencil object, and equal values mean the same object)
             case OP_SCISSOR: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF:
             case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_STENCIL:
