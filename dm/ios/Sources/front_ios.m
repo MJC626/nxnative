@@ -120,6 +120,14 @@ static void front_ios_power_watch(void) {
     [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoPowerStateDidChangeNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
         (void)n; LOG("front end: Low Power Mode → %s (%.0f s after launch)", dm_low_power_now() ? "on" : "off", (now_ns() - g_t0_ns) / 1e9); }];
     LOG("front end: thermal state %d, brightness %.2f, Low Power Mode %s", dm_thermal_now(), g_brightness, dm_low_power_now() ? "on" : "off");
+    // Diagnostic DM_SHOT_PASSDUMP=n: a screenshot taken on the phone (the side and volume-up buttons) dumps the next n frames' passes into the log (DM_NVN_PASSDUMP; every draw
+    // with DM_NVN_PASSDUMP_ALL=1), so a dump lines up with what the player saw without timing a frame number in advance
+    const char *sp = getenv("DM_SHOT_PASSDUMP"); long spn = sp ? atol(sp) : 0;
+    if (spn > 0) {
+        [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationUserDidTakeScreenshotNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
+            (void)n; void dm_gfx_passdump_next(long); static int shots; LOG("front end: screenshot %d (%.0f s after launch): passes of the next %ld frames dumped", ++shots, (now_ns() - g_t0_ns) / 1e9, spn); dm_gfx_passdump_next(spn); }];
+        LOG("front end: a screenshot dumps the next %ld frames' passes (DM_SHOT_PASSDUMP)", spn);
+    }
 }
 
 // Frame-rate counter: the frames put on screen in the last second (nvn_mtl.m counts them for NVN and for the Vulkan layer alike; frames the display link merged away are not counted).
