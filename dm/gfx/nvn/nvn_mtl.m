@@ -5164,7 +5164,7 @@ static int state_op(uint32_t op, const void *a) {
             if (b->what == 1 || b->what == 2) tf_done_put(b->ctl, S.tf_off[0], S.tf_verts);   // what DrawTransformFeedback with this control buffer draws (tf_auto)
             break; }
         case OP_PRIM_RESTART: S.restart = *(const p_prim_restart *)a; break;
-        case OP_RAST_DISCARD: S.rast_discard = ((const p_rast_discard *)a)->on; g_rd_sets[S.rast_discard != 0]++; break;
+        case OP_RAST_DISCARD: S.rast_discard = ((const p_rast_discard *)a)->on; g_rd_sets[S.rast_discard != 0]++; PD("E %llu rasterizer discard %s", g_stat_pass, S.rast_discard ? "on" : "off"); break;
         default: return 0;
     }
     return 1;
@@ -6740,7 +6740,14 @@ static __unsafe_unretained id<MTLRenderPipelineState> tf_pso(NvShader *vs) {
 enum { RDST = 16 };
 static struct { char key[24]; uint64_t n; } g_rdst[RDST]; static int g_nrdst; static uint64_t g_rd_other;
 static int rd_ignore(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_RAST_DISCARD"); v = e && !strcmp(e, "0"); if (v) MLOG("DM_NVN_RAST_DISCARD=0: draws under rasterizer discard are drawn, except transform feedback captures (a test)"); } return v; }
+// DM_NVN_PASSDUMP_RD=<n>: the first frame with n draws under discard (a scene with characters) has the next frame's passes dumped (dm_gfx_passdump_next), for the order of the
+// discard switches and the draws between them; with DM_NVN_PASSDUMP_ALL=1 every draw is listed
 static void rd_note(NvShader *vs) {
+    { static long want = -2; static uint64_t fr, n; static int done;
+      if (want == -2) { const char *e = getenv("DM_NVN_PASSDUMP_RD"); want = e ? atol(e) : 0; }
+      uint64_t f = atomic_load(&g_cur_frame); if (f != fr) { fr = f; n = 0; }
+      if (want > 0 && !done && (long)++n >= want) { done = 1; MLOG("DM_NVN_PASSDUMP_RD: %llu draws under discard in frame %llu, dumping the next frame's passes", (unsigned long long)n, (unsigned long long)f); dm_gfx_passdump_next(1); } }
+    PD("Z %llu draw under rasterizer discard: vertex %s%s", g_stat_pass + !g_enc, vs ? vs->key : "-", rd_ignore() ? " (drawn, DM_NVN_RAST_DISCARD=0)" : " (skipped)");
     const char *k = vs ? vs->key : "-"; int i = 0; while (i < g_nrdst && strcmp(g_rdst[i].key, k)) i++;
     if (i < g_nrdst) g_rdst[i].n++; else if (g_nrdst < RDST) { snprintf(g_rdst[i].key, sizeof g_rdst[i].key, "%s", k); g_rdst[i].n = 1; g_nrdst++; } else g_rd_other++;
     static uint64_t last; uint64_t f = atomic_load(&g_cur_frame);
