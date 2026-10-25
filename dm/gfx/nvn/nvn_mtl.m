@@ -6730,9 +6730,35 @@ static __unsafe_unretained id<MTLRenderPipelineState> tf_pso(NvShader *vs) {
     hm_put_id(&g_pso, &k, ps);
     return ps;
 }
+// Capture statistics (Xenoblade Chronicles 3's characters vanished once captures ran: are the right shaders captured, and what do they write?): per capturing vertex shader, captures,
+// vertices and draws skipped for no active capture; every 300 frames a line per shader with the first vertex's words at the last capture (read back from guest memory, so a frame late),
+// and at its first capture the words that were there before
+enum { TFST = 32 };
+static struct { char key[24]; uint64_t caps, verts, off_skips, at; uint32_t words; } g_tfst[TFST]; static int g_ntfst;
+static void tf_words(const char *what, const char *key, uint64_t at, uint32_t n) {
+    if (!at || !n) return;
+    char line[600]; int o = snprintf(line, sizeof line, "transform feedback %s (vertex %s, %#llx):", what, key, (unsigned long long)at);
+    const uint32_t *w = (const uint32_t *)(uintptr_t)at;
+    for (uint32_t i = 0; i < n && i < 36 && o < (int)sizeof line - 24; i++) { float f; memcpy(&f, &w[i], 4); o += snprintf(line + o, sizeof line - o, " %g", f); }
+    MLOG("%s", line);
+}
+static void tf_stat(NvShader *vs, int captured, const p_draw *dw, uint64_t at) {
+    if (!vs) return;
+    int i = 0; while (i < g_ntfst && strcmp(g_tfst[i].key, vs->key)) i++;
+    if (i == g_ntfst) { if (g_ntfst == TFST) return; snprintf(g_tfst[i].key, sizeof g_tfst[i].key, "%s", vs->key); g_tfst[i].words = vs->tf_stride[0] / 4; g_ntfst++;
+        if (captured) tf_words("first capture, the buffer before", vs->key, at, g_tfst[i].words); }
+    if (captured) { g_tfst[i].caps++; g_tfst[i].verts += dw ? (uint64_t)dw->count : 0; g_tfst[i].at = at; } else g_tfst[i].off_skips++;
+    static uint64_t last; uint64_t f = atomic_load(&g_cur_frame);
+    if (f / 300 != last / 300) { last = f;
+        for (int k = 0; k < g_ntfst; k++) {
+            MLOG("transform feedback up to frame %llu: vertex %s, %llu captures, %llu vertices, %llu draws under discard with no capture active, stride %u", (unsigned long long)f, g_tfst[k].key,
+                 (unsigned long long)g_tfst[k].caps, (unsigned long long)g_tfst[k].verts, (unsigned long long)g_tfst[k].off_skips, g_tfst[k].words * 4);
+            tf_words("last capture, first vertex", g_tfst[k].key, g_tfst[k].at, g_tfst[k].words);
+        } }
+}
 static void tf_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
     __unsafe_unretained NvShader *vs = pr ? pr->sh[0] : nil;
-    if (!S.tf_on) { PD("Z %llu draw skipped: rasterizer discard", g_stat_pass + !g_enc); return; }
+    if (!S.tf_on) { if (vs && vs->tf_fn) tf_stat(vs, 0, dw, 0); PD("Z %llu draw skipped: rasterizer discard", g_stat_pass + !g_enc); return; }
     if (!vs || !vs->tf_fn) { RED_ONCE(100, "transform feedback with vertex shader %s, which has no capture entry point: nothing captured", vs ? vs->key : "-"); return; }
     if (!dw || dw->ind || dw->mdi_cnt || dw->instances > 1 || dw->prim == 6 || dw->prim == 7) { RED_ONCE(101, "transform feedback draw that is indexed, indirect, instanced or a fan / quad list (vertex %s): not captured", vs->key); return; }
     if (dw->count <= 0) return;
@@ -6761,6 +6787,7 @@ static void tf_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
         uint64_t n = (uint64_t)dw->count * vs->tf_stride[b]; pend_add(S.tf[b].addr + S.tf_off[b], n, 4); S.tf_off[b] += n;
     }
     S.tf_verts += (uint64_t)dw->count;
+    tf_stat(vs, 1, dw, S.tf[0].addr + S.tf_off[0] - (uint64_t)dw->count * vs->tf_stride[0]);
     enc_r_draw(en, MTLPrimitiveTypePoint, (NSUInteger)dw->first, (NSUInteger)dw->count);
     m4_end(en);
     args_dirty_all(); g_enc_pso = nil; g_enc_dss = nil; g_ed.ok = 0;
