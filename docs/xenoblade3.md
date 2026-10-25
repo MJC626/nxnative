@@ -7,8 +7,8 @@ Title `010074F013262000`, base game 1.0.0 (SDK 12.3.9); main build `60887a25b665
 | Area | State |
 |---|---|
 | Boot, title, New Game, field, first battle | Playable; 30 fps, Wwise audio |
-| Rendering | Wrong everywhere: black torn blocks on every screen, characters partly or not drawn |
-| Cutscene movies | Black: `movie/mv01005100.webm` is opened but never plays |
+| Rendering | Scenery, UI and effects drawn; no torn blocks since the move to upstream (`xc3` at `dca4729`, checked on the iPhone). Characters (party and enemies) are not drawn |
+| Cutscene movies | Not shown: `movie/mv01005100.webm` is opened, then every 65 MB block (size class 42) the player asks for fails |
 | Saving | Not exercised yet |
 | Update 2.2.0 | Not supported: the profile registers only build v0 (1.0.0) |
 
@@ -77,17 +77,15 @@ All off unless set in `env.txt`.
 
 ## Rendering fix plan
 
-From the last log (2026-10-25): 55 shaders missing, about 40 geometry shaders failing to load, transform feedback and `FenceSync` unimplemented, the opening movie starved of memory.
+From the iPhone log of `dca4729` (2026-10-25): every shader in the map, 22,528 of 22,529 built (geometry shaders replayed on compute), the skinning captures running (`transform feedback: first capture`), and three red kinds left.
 
 | # | Work | Why | Size | Confirmed by |
 |---|---|---|---|---|
-| 1 | **Done, to confirm on the device.** **Shaders from device dumps.** A profile folder (for example `shader_dump/`, `<key>.ctl` + `<key>.code`) that `shader_split.py` reads as one more source and the build script hashes into its split key; fill it from the phone's `shdump` | 35 of the 55 missing shaders are variants of `cmn_assets.wipac`'s GLSLC outputs that the game patches at load time (control and code both differ), so no scan of the game data finds them; the other 20 are in no container the split reads. The dump holds exactly what the GPU gets | Small | No `is not in the shader map` lines |
-| 2 | **Find the black blocks.** One frame with `DM_NVN_SHOT` + `DM_NVN_PASSDUMP`, then `DM_NVN_HILITE` / per-pass texture dumps (`DM_NVN_TEXDUMP`) on the passes that write the blocks; check whether those passes are the dropped geometry-shader or transform-feedback draws, a target never written (Metal leaves new attachments undefined), or a skipped pipeline | The cause is not visible from the log alone | Medium (diagnosis) | A named pass and draw for the blocks |
-| 3 | **Geometry shaders.** 91 of the 22,474 shaders are geometry stages; Metal has none, so SPIRV-Cross emits `unknown main0` and they never build. Emulate: run vertex + geometry as a compute pass writing a vertex buffer (or Metal mesh shaders on A15+), then draw that buffer with the fragment stage | XC3 draws with about 40 of them in the first field | Large | No `(geometry) failed to load` lines |
-| 4 | **Done, to confirm on the device.** **Transform feedback.** Hook `Bind/Begin/End/DrawTransformFeedback` with logging first (buffers, sizes, programs), then: the translator writes the captured vertex outputs to a buffer, the host runs that pass with rasterization off (`SetRasterizerDiscard`), and `DrawTransformFeedback` draws the recorded vertex count | 45 captures per run; likely character skinning or cloth | Large | Characters complete |
-| 5 | **Done, to confirm on the device.** **`nvnCommandBufferFenceSync`**: a sync signalled when the replay passes that point of the command stream | 34 calls per run; an unsignalled sync can leave a resource unused or reused too early | Small | No `FenceSync` red lines |
-| 6 | **Diagnostic added**: at the first failed large allocation, `DM_STATEPOLL` lists the large blocks handed out so far per size class. **Opening movie memory.** Measure the arena's peak commit (log it in `hle_statepoll.c`); if it stays well under 0.75 GB, shrink it, or grow the region past 4 GB with a two-instruction size (`0xfa188c` holds one instruction; a code cave is needed). Then check the movie chain: `movie::Extractor` reading `rom:/movie/…`, the host's `movie::Decoder` (VP9, `hle_movie.c`), the NV12 frame upload | The 65 MB (class 42) blocks fail right after `mv01005100.webm` is opened; no `rom:/movie` read follows | Small–medium | Movie on screen, `large … / 0 failed` |
-| 7 | The one SPIR-V failure: `Subgroup builtins are not available in this type of function` (`dmsh_build.log`) | | Small | Builds |
+| 1 | **`nvnCommandBufferDrawTransformFeedback`.** Upstream records the captures but its `DrawTransformFeedback` is an empty function (`[RED] DrawTransformFeedback: drawing the captured vertex count is not implemented`). End / Pause keep the bytes captured under the control buffer's address; the draw then draws bytes / stride vertices, stride being that of the vertex stream attribute 0 reads (an `OP_TF_DRAW` replayed as a plain array draw) | The characters: their skinned vertices are captured, and the draws that read them are these (34 a run in the old branch's logs) | Small | Characters drawn |
+| 2 | **Geometry shader with transform feedback** (`[RED] geometry draw cannot capture this pipeline (… geometry c01e3ade8e15a842, feedback 1)`, 8 a run): the compute replay of the geometry stage does not write feedback buffers. Capture the geometry stage's output vertices in `nvn_geometry.inc` the way `vs_tf` does for a vertex shader | One effect (`cmn_assets.wipac`'s point-to-quad shader) drawn while a capture is active | Medium | No such red line |
+| 3 | **Opening movie memory.** At the first failure the large-block allocator had handed out 4,045 MB: class 47 1,690 MB (4 GPU pools of about 420 MB), class 28 1,354 MB (2,704 blocks of about 512 KB; frees are not seen), class 46 277 MB, then many small classes. Next: log large-block frees too (find the free path beside `main+0xf55764`) to see what is held, not handed out; then shrink the 0.75 GB small-object arena if its peak is low, or make the allocator give class-28 chunks back | The 65 MB blocks the movie player asks for (`main+0xfa1bb0`, through `main+0xf542a0`) fail 49 times right after the movie is opened | Medium | Movie on screen, `large … / 0 failed` |
+| 4 | The one SPIR-V failure: `Subgroup builtins are not available in this type of function` (`dmsh_build.log`) | | Small | Builds |
+| 5 | UI boxes drawn black (enemy HP bar's right half, portrait frames, counters; seen before the move to upstream): check again on `xc3` | | Diagnosis | |
 
 ## Before calling it supported
 
