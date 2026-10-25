@@ -62,6 +62,7 @@ OBS = {
     (0x343d68, 26, 'd10503ff', 'movie request entry (x1 = request: +0x10 movie name, +0x34 / +0x38 flags; builds movie/%s.webm when both are 0); orig sub sp, sp, #0x140'),
     (0x3e874, 27, 'a9bd7bfd', 'movie open entry (x0 = player, +0x40 must be set; x2 = path); orig stp x29, x30, [sp, #-0x30]!'),
     (0xf558e8, 28, 'b94003fb', 'large-block allocation returned (main+0xf55fb4; x0 = block or 0, x27 = size class, x25 = size; caller of main+0xf542a0 = [x29 + 8]); orig ldr w27, [sp]'),
+    (0xfa1bb0, 30, '2a0003e8', 'heap allocation returned (main+0xfa1b3c, after bl main+0xf542a0; x19 = heap: +0x30 bytes in use, +0x40 cap, +0x48 count; w0 bit 0 = done); orig mov w8, w0'),
     (0xf5585c, 29, '8b1b16c8', 'small-object allocation returned (main+0xf55a90; x0 = block or 0, x27 = size class, x25 = size); orig add x8, x22, x27, lsl #5'),
   ],
 }

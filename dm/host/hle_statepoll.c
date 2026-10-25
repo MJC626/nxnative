@@ -21,7 +21,8 @@ static void class_name(uint64_t vt, char *out, size_t n) {   // Itanium ABI: vta
     buf[sizeof buf - 1] = 0; snprintf(out, n, "%s", buf[0] ? buf : "?");
 }
 static void snd_report(void);
-static _Atomic uint64_t g_al_ok[2], g_al_fail[2];   // guest allocator results (al_hit)
+static _Atomic uint64_t g_al_ok[2], g_al_fail[2];
+static _Atomic uint64_t g_hp_obj, g_hp_peak, g_hp_now;   // the heap's bytes in use, last seen and peak (hp_alloc)   // guest allocator results (al_hit)
 static int sp_on(void) {   // read on the first hit, not in the constructor: on iOS Documents/env.txt is applied in main(), after constructors run
     static int on = -1; if (on < 0) { const char *e = getenv("DM_STATEPOLL"); on = e && *e && *e != '0'; if (on) LOG("state poll: on"); } return on;
 }
@@ -44,6 +45,7 @@ static void sp_hit(uint64_t obj, uint32_t res) {
             g_sp[i].reported = g_sp[i].n;
         }
         snd_report();
+        if (atomic_load(&g_hp_obj)) LOG("state poll: heap %#llx: %.1f MB in use, peak %.1f MB", (unsigned long long)atomic_load(&g_hp_obj), atomic_load(&g_hp_now) / 1048576.0, atomic_load(&g_hp_peak) / 1048576.0);
         LOG("state poll: guest allocations so far: small %llu ok / %llu failed, large %llu ok / %llu failed", (unsigned long long)g_al_ok[0], (unsigned long long)g_al_fail[0], (unsigned long long)g_al_ok[1], (unsigned long long)g_al_fail[1]);
     }
     pthread_mutex_unlock(&g_sp_lock);
@@ -124,10 +126,20 @@ static void al_hit(const uint64_t *r, int large) {
         if (m) snprintf(cs, sizeof cs, "%s+%#llx", m->name, (unsigned long long)(caller - (uint64_t)m->base)); else snprintf(cs, sizeof cs, "%#llx", (unsigned long long)caller);
         LOG("[RED] guest allocation failed (%s): size class %llu, size %#llx, asked from %s", large ? "large block" : "small object", (unsigned long long)r[27], (unsigned long long)r[25], cs); }
 }
+// The heap's own count of bytes in use (OBS 30, after the allocation call of main+0xfa1b3c; x19 = heap, +0x30 bytes in use, +0x40 the cap its check was cut from, +0x48 allocations):
+// its peak every 10 s, and the count at each failure (first 20). Bytes in use near the 4 GB region at a failure means the region is full; far below it, that freed chunks are not reused
+static void hp_alloc(const uint64_t *r) {
+    if (!sp_on()) return;
+    uint64_t used = 0; if (!rd64(r[19] + 0x30, &used)) return;
+    atomic_store(&g_hp_obj, r[19]); atomic_store(&g_hp_now, used);
+    uint64_t pk = atomic_load(&g_hp_peak); while (used > pk && !atomic_compare_exchange_weak(&g_hp_peak, &pk, used)) {}
+    if (!(r[0] & 1)) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 20) { uint64_t cap = 0, cnt = 0; rd64(r[19] + 0x40, &cap); rd64(r[19] + 0x48, &cnt);
+        LOG("[RED] heap %#llx: an allocation failed with %.1f MB in use (peak %.1f MB, cap %.1f MB, %u allocations live)", (unsigned long long)r[19], used / 1048576.0, atomic_load(&g_hp_peak) / 1048576.0, cap / 1048576.0, (unsigned)cnt); } }
+}
 static void al_large(const uint64_t *r) { al_hit(r, 1); }
 static void al_small(const uint64_t *r) { al_hit(r, 0); }
 static void sp_child(const uint64_t *r) { uint64_t obj = 0; if (rd64(r[21], &obj)) sp_hit(obj, (uint32_t)r[0]); }
 static void sp_cur(const uint64_t *r) { uint64_t end = 0, obj = 0; if (rd64(r[19] + 0x20, &end) && rd64(end - 0x10, &obj)) sp_hit(obj, (uint32_t)r[0]); }
 __attribute__((constructor)) static void statepoll_gates(void) {
-    gate_obs_set(OBS_STATE_CHILD, sp_child); gate_obs_set(OBS_STATE_CUR, sp_cur); gate_obs_set(OBS_SOUND_PLAYING, sp_sound); gate_obs_set(OBS_MOVIE_UPDATE, mv_update); gate_obs_set(OBS_MOVIE_REQUEST, mv_request); gate_obs_set(OBS_MOVIE_OPEN, mv_open); gate_obs_set(OBS_ALLOC_LARGE, al_large); gate_obs_set(OBS_ALLOC_SMALL, al_small);
+    gate_obs_set(OBS_STATE_CHILD, sp_child); gate_obs_set(OBS_STATE_CUR, sp_cur); gate_obs_set(OBS_SOUND_PLAYING, sp_sound); gate_obs_set(OBS_MOVIE_UPDATE, mv_update); gate_obs_set(OBS_MOVIE_REQUEST, mv_request); gate_obs_set(OBS_MOVIE_OPEN, mv_open); gate_obs_set(OBS_ALLOC_LARGE, al_large); gate_obs_set(OBS_ALLOC_SMALL, al_small); gate_obs_set(OBS_HEAP_ALLOC, hp_alloc);
 }

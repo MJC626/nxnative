@@ -75,8 +75,9 @@ enum { OBS_MOVIE_RING_LINK = 19, OBS_MOVIE_RING_UNLINK = 20,   // Metroid Dread 
        OBS_UE_MALLOC = 21,                                       // DRAGON QUEST VII Reimagined 1.2.0: Unreal's allocator object just made (hle_uemalloc.c)
        OBS_STATE_CHILD = 22, OBS_STATE_CUR = 23, OBS_SOUND_PLAYING = 24,   // Xenoblade Chronicles 3 1.0.0 (hle_statepoll.c, DM_STATEPOLL=1): scene states, sound polls,
        OBS_MOVIE_UPDATE = 25, OBS_MOVIE_REQUEST = 26, OBS_MOVIE_OPEN = 27,  // the opening-movie chain,
-       OBS_ALLOC_LARGE = 28, OBS_ALLOC_SMALL = 29,                          // guest allocator results
-       OBS_MAX = 30 };
+       OBS_ALLOC_LARGE = 28, OBS_ALLOC_SMALL = 29,                          // guest allocator results,
+       OBS_HEAP_ALLOC = 30,                                                 // the heap's own byte count after each allocation
+       OBS_MAX = 31 };
 void gate_obs_set(int id, void (*fn)(const uint64_t *regs));
 int gate_obs_present(int id);
 uint64_t now_ns(void);
