@@ -109,6 +109,8 @@ static uint64_t g_done;                         // Highest completed fence value
 static uint64_t g_arena_made;
 static int g_allocprof = -1; static uint64_t g_ap_bytes[64], g_ap_fn[8];
 static int g_opprof = -1; static uint64_t g_op_ns[64], g_op_cnt[64];   // DM_NVN_OPPROF=1: replay CPU time by operation type (mtl_opprof_report)
+static uint64_t g_geo_st[4];   // geometry draws: all, CPU-GPU waits, waits saved (no GPU write since the last one), DrawTransformFeedback of a geometry capture (nvn_geometry.inc)
+static int g_tf_gpu_draw;      // the draw in progress is DrawTransformFeedback of a capture the GPU counted (tf_auto)
 #define AP_B uint64_t _ap0 = g_allocprof > 0 ? g_dev.currentAllocatedSize : 0
 #define AP_E(i) do { if (g_allocprof > 0) { uint64_t _n = g_dev.currentAllocatedSize; if (_n > _ap0) g_ap_fn[i] += _n - _ap0; } } while (0)   // Per-frame arenas created so far (4 MiB each; for the memory report)
 static _Atomic int g_last_commit_error;
@@ -541,7 +543,8 @@ static int vis_in_ring(id<MTLBuffer> b) { for (int i = 0; i < g_vis_ring_n; i++)
 static int g_vis_on, g_vis_counting, g_vis_cur = -1; static uint64_t g_vis_cur_pass;
 static vis_slot *g_vs; static int g_nvs, g_vscap;      // Slots since the last reset
 static uint64_t g_cnt_report[32], g_cnt_reset[32];       // Report / reset counts per counter type (diagnostics)
-static _Atomic uint64_t g_sp_zero, g_sp_some;              // samples-passed results written as 0 / more than 0 (mtl_counter_report)
+static _Atomic uint64_t g_sp_zero, g_sp_some, g_sp_nodraw, g_sp_skipped;   // samples-passed results (mtl_counter_report): 0 from counted draws / more than 0 / no draw since the reset / draws, none counted
+static uint32_t g_vq_try, g_vq_cnt;                        // draws since the samples-passed reset: issued / counted (reached the visibility slot)
 static void vis_clear(void) { for (int i = 0; i < g_nvs; i++) CFRelease(g_vs[i].buf); g_nvs = 0; g_vis_cur = -1; }
 static vis_list *vis_snapshot(void) {
     vis_list *l = malloc(sizeof *l + g_nvs * sizeof(vis_slot)); l->n = g_nvs;
@@ -646,9 +649,10 @@ void *objc_autoreleasePoolPush(void); void objc_autoreleasePoolPop(void *);
 static void *g_sub_pool;
 static int tbdr_on(void);
 
+static uint64_t g_wr_epoch, g_sub_wr0;   // g_sub_wr0: g_wr_epoch when this submission began (geo_draw)
 static uint64_t g_sub_serial;   // Submission index (used by the parallel precompile's 'predict only once per submission')
 void mtl_sub_begin(void) {
-    mtl_init(); g_sub_serial++; g_seg = 0; seg_clk_put(g_sclk); g_sclk = NULL; g_rc_npend = 0; g_rc_skip = 0;
+    mtl_init(); g_sub_serial++; g_sub_wr0 = g_wr_epoch; g_seg = 0; seg_clk_put(g_sclk); g_sclk = NULL; g_rc_npend = 0; g_rc_skip = 0;
     defer_drain();
     defer_reset();
     warm_claim();
@@ -847,7 +851,7 @@ uint64_t mtl_blit_barriers(void) { return g_blit_barriers; }
 static int bw_hit(uint64_t lo, uint64_t hi) { for (int i = 0; i < g_bw_n; i++) if (lo < g_bw_hi[i] && g_bw_lo[i] < hi) return 1; return 0; }
 static int br_hit(uint64_t lo, uint64_t hi) { for (int i = 0; i < g_br_n; i++) if (lo < g_br_hi[i] && g_br_lo[i] < hi) return 1; return 0; }
 // buffer → buffer / fill: reads [rlo, rhi) (0, 0 when nothing is read), writes [wlo, whi)
-static uint64_t g_wr_epoch;   // Bumped by every buffer write outside a render pass (copy / update / fill, texture → buffer, dispatch): indirect-draw conversions made before it are stale (ixc_run)
+                              // g_wr_epoch: bumped by every buffer write outside a render pass (copy / update / fill, texture → buffer, dispatch): indirect-draw conversions made before it are stale (ixc_run)
 static uint64_t g_mdx_epoch;  // Bumped by GPU writes that can change an indirect-count multi-draw's records or count (copy, fill, texture → buffer, dispatch; see mdx_run)
 static id<MTL4ComputeCommandEncoder> blit_buf(uint64_t rlo, uint64_t rhi, uint64_t wlo, uint64_t whi) {
     g_wr_epoch++;
@@ -1095,11 +1099,12 @@ void mtl_counter_stats(uint64_t rep[32], uint64_t rst[32]) { memcpy(rep, g_cnt_r
 // With the 300-frame report: counter reports per frame by type (NVNcounterType: 0 timestamp, 1 samples passed, 0x10 timestamp top; the others are written as 0) and the
 // samples-passed results written as 0 or more, for culling the game decides on the GPU's counts
 void mtl_counter_report(uint64_t frame) {
-    static uint64_t prep[32], pz, ps, pf; uint64_t z = atomic_load(&g_sp_zero), sm = atomic_load(&g_sp_some);
+    static uint64_t prep[32], pz, ps, pn, pk, pf; uint64_t z = atomic_load(&g_sp_zero), sm = atomic_load(&g_sp_some), nd = atomic_load(&g_sp_nodraw), sk = atomic_load(&g_sp_skipped);
     if (pf && frame > pf) { char b[400]; int n = 0; double nf = (double)(frame - pf);
         for (int t = 0; t < 32 && n < 360; t++) if (g_cnt_report[t] > prep[t]) n += snprintf(b + n, sizeof b - n, " type %#x %.1f", t, (g_cnt_report[t] - prep[t]) / nf);
-        if (n) MLOG("counter reports per frame up to frame %llu:%s; samples passed written as 0: %llu, more than 0: %llu", frame, b, (unsigned long long)(z - pz), (unsigned long long)(sm - ps)); }
-    memcpy(prep, g_cnt_report, sizeof prep); pz = z; ps = sm; pf = frame;
+        if (n) MLOG("counter reports per frame up to frame %llu:%s; samples passed: more than 0 %llu, 0 from counted draws %llu, 0 with no draw since the reset %llu, 0 with every draw skipped before counting %llu",
+                    frame, b, (unsigned long long)(sm - ps), (unsigned long long)(z - pz), (unsigned long long)(nd - pn), (unsigned long long)(sk - pk)); }
+    memcpy(prep, g_cnt_report, sizeof prep); pz = z; ps = sm; pn = nd; pk = sk; pf = frame;
 }
 
 // Counter timestamps (19.2 MHz) are taken from the guest clock (hle_os.c guest_ns, the same source as svc GetSystemTick / cntpct): on hardware GPU timestamps and the CPU counter share one timebase, and games compare them.
@@ -1252,7 +1257,8 @@ uint64_t mtl_sub_commit(void) {
             else if (ops[i].kind == 3) {   // Samples passed: the sum of all slots since the reset
                 vis_list *l = ops[i].vis; uint64_t sum = 0;
                 for (int k = 0; k < l->n; k++) { sum += ((const uint64_t *)((__bridge id<MTLBuffer>)l->s[k].buf).contents)[l->s[k].slot]; CFRelease(l->s[k].buf); }
-                free(l); uint64_t rec[2] = {sum, gpu_ticks()}; memcpy((void *)ops[i].addr, rec, sizeof rec); atomic_fetch_add(sum ? &g_sp_some : &g_sp_zero, 1);
+                free(l); uint64_t rec[2] = {sum, gpu_ticks()}; memcpy((void *)ops[i].addr, rec, sizeof rec);
+                atomic_fetch_add(sum ? &g_sp_some : !ops[i].mode ? &g_sp_nodraw : !ops[i].v ? &g_sp_skipped : &g_sp_zero, 1);
             }
             else { uint64_t t = rep_ticks(&ops[i], sc, seg_last, c0, c1), rec[2] = {(ops[i].type == 0 || ops[i].type == 0x10) && !DM_GAME_RENDER_COND ? t : 0, t}; memcpy((void *)ops[i].addr, rec, sizeof rec); }   // render_cond: a timestamp report's counter field is 0, as on the GPU (see rc_value)
         }
@@ -1305,7 +1311,7 @@ void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); mtl_init
 
 // ================= Render replay =================
 #include "../../host/front.h"
-static int g_red_once[116];
+static int g_red_once[120];
 #define RED_ONCE(k, ...) do { if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -2173,6 +2179,8 @@ void mtl_opprof_report(uint64_t frame) {   // DM_NVN_OPPROF=1, with the 300-fram
             char on[16]; snprintf(on, sizeof on, "op %d", o);
             n += snprintf(b + n, sizeof b - n, "%s %s %.2f ms (%.0f, %.1f us each)", k ? ";" : "", o < OP_COUNT_ && nm[o] ? nm[o] : on, d / 1e6 / nf, c / nf, c ? d / 1e3 / c : 0); }
         MLOG("replay CPU by operation up to frame %llu: %.2f ms per frame in all;%s", frame, all / 1e6 / nf, b);
+        static uint64_t pg[4]; MLOG("geometry draws per frame up to frame %llu: %.1f, CPU-GPU waits %.1f (saved %.1f), feedback draws of a geometry capture %.1f (no wait)", frame,
+                                     (g_geo_st[0] - pg[0]) / nf, (g_geo_st[1] - pg[1]) / nf, (g_geo_st[2] - pg[2]) / nf, (g_geo_st[3] - pg[3]) / nf); memcpy(pg, g_geo_st, sizeof pg);
     }
     memcpy(pns, g_op_ns, sizeof pns); memcpy(pcnt, g_op_cnt, sizeof pcnt); pf = frame;
 }
@@ -6852,6 +6860,16 @@ static void tf_store_draw(NvShader *vs, const p_draw *dw, const p_draw_idx *di) 
     { static int once; if (!once++) MLOG("rasterizer discard: first draw run for its vertex stage's memory writes (vertex %s, %d vertices x %d)", vs->key, n, inst); }
     PD("T %llu vertex stage only (memory writes) vs=%s %s count=%d instances=%d", g_stat_pass, vs->key, di ? "indexed" : "array", n, inst);
 }
+// tf_draw's indexed captures: vertex i of the draw (thread i) takes the scratch vertex its index names
+static const char k_tf_gather_msl[] =
+"#include <metal_stdlib>\nusing namespace metal;\n"
+"struct tf_gather_job { device const uchar *idx; device const uint *src; device uint *dst; uint n, isz, words, span; int shift; uint pad; };\n"
+"kernel void tf_gather(constant tf_gather_job& j [[buffer(0)]], uint i [[thread_position_in_grid]]) {\n"
+" if (i >= j.n) return;\n"
+" uint v = j.isz == 1 ? uint(j.idx[i]) : j.isz == 2 ? uint(((device const ushort *)j.idx)[i]) : ((device const uint *)j.idx)[i];\n"
+" int r = int(v) + j.shift; bool in = r >= 0 && uint(r) < j.span;\n"
+" for (uint c = 0; c < j.words; c++) j.dst[i * j.words + c] = in ? j.src[uint(r) * j.words + c] : 0u;\n"
+"}\n";
 static void tf_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
     __unsafe_unretained NvShader *vs = pr ? pr->sh[0] : nil;
     // A vertex shader that only writes memory (dmsh_build.py vs_stores: main0_tf with no feedback buffer; Xenoblade Chronicles 3's skinning into storage buffers) runs whether or not a
@@ -6860,40 +6878,79 @@ static void tf_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
     if (!S.tf_on && !stores_only) { if (vs && vs->tf_fn) tf_stat(vs, 0, dw, 0); rd_note(vs); PD("Z %llu draw skipped: rasterizer discard", g_stat_pass + !g_enc); return; }
     if (!vs || !vs->tf_fn) { rd_note(vs); RED_ONCE(100, "transform feedback with vertex shader %s, which has no capture entry point: nothing captured", vs ? vs->key : "-"); return; }
     if (stores_only) { tf_store_draw(vs, dw, di); return; }
-    if (!dw || dw->ind || dw->mdi_cnt || dw->instances > 1 || dw->prim == 6 || dw->prim == 7) { RED_ONCE(101, "transform feedback draw that is indexed, indirect, instanced or a fan / quad list (vertex %s): not captured", vs->key); return; }
-    if (dw->count <= 0) return;
+    // Captures in draw order, as Maxwell writes them: instance by instance, and for an indexed draw index by index. The capture entry point stores vertex v at v × stride, so an array
+    // draw runs once per instance with its own write pointer, and an indexed draw first captures every vertex of its index range into scratch by vertex number (an array draw over
+    // [lowest, highest index] + base vertex), then tf_gather copies them out in index order (an index met twice is written twice). Xenoblade Chronicles 3 skins characters with
+    // indexed and instanced captures (070083826f16072b of shd_post.wishp, 24 bytes a vertex): not captured, their vertices stayed stale. Fans and quad lists (decomposed into
+    // triangles by the GPU) and indirect draws still are not captured
+    int prim = dw ? dw->prim : di->prim;
+    if ((dw && (dw->ind || dw->mdi_cnt)) || (di && (di->ind || di->mdi_cnt)) || prim == 6 || prim == 7) { RED_ONCE(101, "transform feedback draw that is indirect or a fan / quad list (vertex %s): not captured", vs->key); return; }
+    int n = dw ? dw->count : di->count, inst = dw ? (dw->instances > 0 ? dw->instances : 1) : (di->instances > 0 ? di->instances : 1);
+    if (n <= 0) return;
+    uint32_t lo = 0, hi = 0; int isz = 0; uint64_t igpu = 0;
+    if (di) {
+        isz = di->itype == 0 ? 1 : di->itype == 1 ? 2 : di->itype == 2 ? 4 : 0; void *mb; uint64_t mo;
+        if (!isz || !nvn_host_readable(di->ibuf, (uint64_t)n * isz) || pend_hits(di->ibuf, (uint64_t)n * isz) || !mtl_gpu_addr(di->ibuf, (uint64_t)n * isz, &mb, &mo, &igpu)) {
+            RED_ONCE(116, "indexed transform feedback draw (vertex %s): index buffer %#llx unreadable, written by the GPU in this submission or of type %d: not captured", vs->key, (unsigned long long)di->ibuf, di->itype); return; }
+        uint32_t rs = S.restart.on ? (isz == 1 ? 0xffu : isz == 2 ? 0xffffu : 0xffffffffu) & S.restart.index : 0; lo = UINT32_MAX;
+        for (int k = 0; k < n; k++) { uint32_t v = 0; memcpy(&v, (const uint8_t *)(uintptr_t)di->ibuf + (size_t)k * isz, isz); if (S.restart.on && v == rs) continue; if (v < lo) lo = v; if (v > hi) hi = v; }
+        if (lo > hi) return;
+        if (S.restart.on) RED_ONCE(117, "indexed transform feedback draw (vertex %s) with primitive restart: restart indices are captured as zero vertices", vs->key);
+    }
+    int64_t vlo = di ? (int64_t)lo + di->base_vertex : dw->first; uint64_t span = di ? (uint64_t)hi - lo + 1 : (uint64_t)n;
+    if (vlo < 0 || span > (64u << 20)) { RED_ONCE(118, "transform feedback draw (vertex %s) over vertices %lld + %llu: not captured", vs->key, (long long)vlo, (unsigned long long)span); return; }
     uint64_t gpu[4] = {0};
     for (int b = 0; b < 4; b++) {
         if (!vs->tf_stride[b]) continue;
-        uint64_t n = (uint64_t)dw->count * vs->tf_stride[b], at = S.tf[b].addr + S.tf_off[b]; void *mb; uint64_t mo;
-        if (!S.tf[b].addr || S.tf_off[b] + n > S.tf[b].size || !mtl_gpu_addr(at, n, &mb, &mo, &gpu[b])) {
-            RED_ONCE(102, "transform feedback buffer %d of vertex %s is unbound, too small or in no memory pool (%#llx + %llu of %llu): not captured", b, vs->key, (unsigned long long)S.tf[b].addr, (unsigned long long)(S.tf_off[b] + n), (unsigned long long)S.tf[b].size);
+        uint64_t nb = (uint64_t)n * inst * vs->tf_stride[b], at = S.tf[b].addr + S.tf_off[b]; void *mb; uint64_t mo;
+        if (!S.tf[b].addr || S.tf_off[b] + nb > S.tf[b].size || !mtl_gpu_addr(at, nb, &mb, &mo, &gpu[b])) {
+            RED_ONCE(102, "transform feedback buffer %d of vertex %s is unbound, too small or in no memory pool (%#llx + %llu of %llu): not captured", b, vs->key, (unsigned long long)S.tf[b].addr, (unsigned long long)(S.tf_off[b] + nb), (unsigned long long)S.tf[b].size);
             return; }
     }
+    static id<MTLComputePipelineState> gather;
+    if (di && !gather) { NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(k_tf_gather_msl) options:nil error:&e];
+        if (lib) gather = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"tf_gather"] error:&e];
+        if (!gather) { RED_ONCE(119, "transform feedback gather kernel: %s", e.localizedDescription.UTF8String); return; } }
     __unsafe_unretained id<MTLRenderPipelineState> ps = tf_pso(vs);
     if (!ps) return;
     rp_end(); ubd_land();   // the deferred inline updates first: this draw comes before draw's conflict check (ubd_conflict) and writes its capture buffers
     // ubd_land copies them in the copy encoder and leaves it open, as does a copy or dispatch just before: a render encoder opened beside it is invalid (Metal validation: "Command buffer already
     // has an open command encoder"). Pokémon Legends: Z-A crashed in the driver when that copy encoder ended, two minutes into a new game on the Mac (GitHub issue #101)
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
-    MTL4RenderPassDescriptor *d = [MTL4RenderPassDescriptor new]; d.renderTargetWidth = 1; d.renderTargetHeight = 1; d.defaultRasterSampleCount = 1;
-    id<MTL4RenderCommandEncoder> en = enc_r_begin(d);
-    enc_r_pso(en, ps);
-    bind_vbufs(en);
-    vconv_bind(en, vs, 1, dw, NULL);
-    args_dirty_all(); encode_args(en, vs, 0, 1);
-    for (int b = 0; b < 4; b++) if (vs->tf_stride[b]) {   // vertex v of the draw (first + i) stores at v × stride: the pointer starts first × stride before the write offset
-        enc_r_vbuf(en, TF_SLOT + b, gpu[b] - (uint64_t)dw->first * vs->tf_stride[b]);
-        uint64_t n = (uint64_t)dw->count * vs->tf_stride[b]; pend_add(S.tf[b].addr + S.tf_off[b], n, 4); S.tf_off[b] += n;
+    uint64_t tmp[4] = {0};
+    if (di) for (int b = 0; b < 4; b++) if (vs->tf_stride[b]) { id<MTLBuffer> tb; size_t to = arena_alloc((size_t)(span * vs->tf_stride[b]), &tb); tmp[b] = tb.gpuAddress + to; }
+    int bi = dw ? dw->base_instance : di->base_instance;
+    p_draw vr = {.prim = prim, .first = (int32_t)vlo, .count = (int32_t)span, .instances = 1};
+    for (int k = 0; k < inst; k++) {
+        MTL4RenderPassDescriptor *d = [MTL4RenderPassDescriptor new]; d.renderTargetWidth = 1; d.renderTargetHeight = 1; d.defaultRasterSampleCount = 1;
+        id<MTL4RenderCommandEncoder> en = enc_r_begin(d);
+        enc_r_pso(en, ps);
+        bind_vbufs(en);
+        vr.base_instance = bi + k; vconv_bind(en, vs, 1, &vr, NULL);
+        args_dirty_all(); encode_args(en, vs, 0, 1);
+        for (int b = 0; b < 4; b++) if (vs->tf_stride[b])   // vertex v stores at v × stride: the pointer starts vlo × stride before where vertex vlo goes
+            enc_r_vbuf(en, TF_SLOT + b, (di ? tmp[b] : gpu[b] + (uint64_t)k * n * vs->tf_stride[b]) - (uint64_t)vlo * vs->tf_stride[b]);
+        enc_r_draw_instanced(en, MTLPrimitiveTypePoint, (NSUInteger)vlo, (NSUInteger)span, 1, (NSUInteger)(bi + k));
+        m4_end(en);
+        if (di) {   // index order: out[k × n + i] = scratch[index i + base vertex − vlo]
+            id<MTL4ComputeCommandEncoder> ce = enc_c_begin(NULL); enc_c_pso(ce, gather);
+            for (int b = 0; b < 4; b++) if (vs->tf_stride[b]) {
+                struct { uint64_t idx, src, dst; uint32_t n, isz, words, span; int32_t shift; uint32_t pad; } j = {igpu, tmp[b], gpu[b] + (uint64_t)k * n * vs->tf_stride[b], (uint32_t)n, (uint32_t)isz,
+                    vs->tf_stride[b] / 4, (uint32_t)span, (int32_t)(di->base_vertex - vlo), 0};
+                id<MTLBuffer> jb; size_t jo = arena_alloc(sizeof j, &jb); memcpy((uint8_t *)jb.contents + jo, &j, sizeof j);
+                enc_c_args(ce, jb.gpuAddress + jo, 0);
+                enc_c_dispatch(ce, MTLSizeMake(((NSUInteger)n + 63) / 64, 1, 1), MTLSizeMake(64, 1, 1));
+            }
+            enc_c_end(ce);
+        }
     }
-    if (!stores_only) S.tf_verts += (uint64_t)dw->count;
-    tf_stat(vs, 1, dw, S.tf[0].addr + S.tf_off[0] - (uint64_t)dw->count * vs->tf_stride[0]);
-    enc_r_draw(en, MTLPrimitiveTypePoint, (NSUInteger)dw->first, (NSUInteger)dw->count);
-    m4_end(en);
+    for (int b = 0; b < 4; b++) if (vs->tf_stride[b]) { uint64_t nb = (uint64_t)n * inst * vs->tf_stride[b]; pend_add(S.tf[b].addr + S.tf_off[b], nb, 4); S.tf_off[b] += nb; }
+    S.tf_verts += (uint64_t)n * inst;
+    p_draw st = {.count = n * inst}; tf_stat(vs, 1, &st, S.tf[0].addr + S.tf_off[0] - (uint64_t)n * inst * vs->tf_stride[0]);
     args_dirty_all(); g_enc_pso = nil; g_enc_dss = nil; g_ed.ok = 0;
-    { static int once[2]; if (!once[stores_only]++) { if (stores_only) MLOG("rasterizer discard: first draw run for its vertex stage's memory writes (vertex %s, %d vertices)", vs->key, dw->count);
-                                                      else MLOG("transform feedback: first capture (vertex %s, %d vertices)", vs->key, dw->count); } }
-    PD("T %llu tf capture vs=%s first=%d count=%d written %llu/%llu/%llu/%llu", g_stat_pass, vs->key, dw->first, dw->count,
+    { static int once[3]; int w = di ? 2 : inst > 1; if (!once[w]++) MLOG("transform feedback: first %s capture (vertex %s, %d vertices x %d instances%s)", w == 2 ? "indexed" : w ? "instanced" : "array", vs->key, n, inst,
+                                                                         w == 2 ? ", gathered in index order" : ""); }
+    PD("T %llu tf capture vs=%s %s first=%lld count=%d instances=%d written %llu/%llu/%llu/%llu", g_stat_pass, vs->key, di ? "indexed" : "array", (long long)vlo, n, inst,
        (unsigned long long)S.tf_off[0], (unsigned long long)S.tf_off[1], (unsigned long long)S.tf_off[2], (unsigned long long)S.tf_off[3]);
 }
 
@@ -7006,6 +7063,7 @@ static int lc_keeps(uint32_t op) {
 }
 
 static void draw(const p_draw *dw, const p_draw_idx *di) {
+    if (g_vis_counting) g_vq_try++;   // counter report diagnostics (mtl_counter_report)
     g_draw_binst = (uint32_t)(dw ? dw->base_instance : di ? di->base_instance : 0);   // c0 + 0x644 of the stages that read the driver segment (encode_args)
     if (!g_geo_program && S.prog) {
         NvProg *geometry_program = prog_get(S.prog);
@@ -7164,6 +7222,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
                     g_vs[g_nvs++] = (vis_slot){(void *)CFBridgingRetain(g_vis), (uint32_t)g_vis_cur}; }
             }
             if (g_vis_cur >= 0 && g_enc_vis != g_vis_cur + 1) { enc_r_visibility(en, MTLVisibilityResultModeCounting, (NSUInteger)g_vis_cur * 8); g_enc_vis = g_vis_cur + 1; }
+            if (g_vis_cur >= 0) g_vq_cnt++;
         }
     }
     g_stat_draw++;
@@ -7919,7 +7978,7 @@ void mtl_exec(const uint8_t *p) {
             case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, (const uint8_t *)a + 8, 8); g_cnt_report[t & 31]++;
                 PD("Q report type=%llu cmd=%p dst=%#llx", (unsigned long long)t, p, (unsigned long long)ad);
                 if (DM_GAME_RENDER_COND) rc_note(ad, t == 0 || t == 0x10 ? 1 : 2);
-                if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) { post((post_op){3, NULL, 0, 0, ad, (uint32_t)t, vis_snapshot()}); g_vis_cur = -1; }
+                if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) { post((post_op){3, NULL, g_vq_try, g_vq_cnt, ad, (uint32_t)t, vis_snapshot()}); g_vis_cur = -1; }   // mode / v: draws issued / counted since the reset
                 else mtl_sub_counter(ad, (uint32_t)t);
                 break; }
             case OP_RENDER_COND: { const p_render_cond *rc = a;   // recorded only with the profile key render_cond (hle_nvn.c)
@@ -7935,7 +7994,7 @@ void mtl_exec(const uint8_t *p) {
 #ifdef NVN_RT_RANGE_TEST
                     rr_reset();
 #endif
-                    g_vis_on = 1; g_vis_counting = 1; vis_clear();
+                    g_vis_on = 1; g_vis_counting = 1; vis_clear(); g_vq_try = g_vq_cnt = 0;
                     // The first reset can come inside a render pass that was begun without a visibility buffer (Octopath Traveler 0: Unreal's occlusion queries, once at boot): split the pass
                     // here, so the continuation is begun with the buffer and its samples are counted (they used not to be: RED "occlusion query counting began in a pass without a visibility buffer")
                     if (g_enc && !g_enc_has_vis) { PD("M %llu occlusion query counting starts: render pass split here", g_stat_pass); rp_end(); } }
@@ -7997,7 +8056,7 @@ void mtl_exec(const uint8_t *p) {
                 break;
             }
             case OP_DRAW: { if (g_rc_skip) break; p_draw t; g_exec_cur = p; g_exec_next = p + h.size; draw(draw_rec(a, h.size, &t), NULL); g_exec_next = NULL; break; }   // Lookahead start point
-            case OP_TF_DRAW: { if (g_rc_skip) break; p_draw t; if (!tf_auto(a, &t)) break; g_exec_cur = p; g_exec_next = p + h.size; draw(&t, NULL); g_exec_next = NULL; break; }   // DrawTransformFeedback (tf_auto)
+            case OP_TF_DRAW: { if (g_rc_skip) break; p_draw t; if (!tf_auto(a, &t)) break; g_exec_cur = p; g_exec_next = p + h.size; g_tf_gpu_draw = t.ind != 0; draw(&t, NULL); g_tf_gpu_draw = 0; g_exec_next = NULL; break; }   // DrawTransformFeedback (tf_auto)
             case OP_DRAW_IDX: { if (g_rc_skip) break; p_draw_idx t; g_exec_cur = p; g_exec_next = p + h.size; draw(NULL, draw_idx_rec(a, h.size, &t)); g_exec_next = NULL; break; }
             // Do not mark dirty if the state did not change (the game often re-sends the same program / state block / vertex format before each draw; the dirty flag only decides whether to re-fetch the pipeline / depth-stencil object, and equal values mean the same object)
             case OP_SCISSOR: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF:

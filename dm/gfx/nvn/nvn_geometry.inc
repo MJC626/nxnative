@@ -65,12 +65,20 @@ static void geo_draw(NvProg *pr, const p_draw *dw0, const p_draw_idx *di0) {
     // Indirect records and GPU-written index data need a coherent CPU snapshot
     // for primitive assembly. This is deliberately a correctness path; no such
     // wait is added to ordinary VS/FS draws.
-    int wait = ind != 0 || di0 != NULL;  // CPU assembly must also see writes from earlier submissions.
-    for (int i = 0; i < 16; i++) if (S.vbuf[i].size && pend_hits(S.vbuf[i].address, S.vbuf[i].size)) wait = 1;
-    for (int i = 0; i < vs->rf.nv; i++) if (vconv_wanted(&vs->rf, i, NULL, 0)) wait = 1;
+    // DrawTransformFeedback of a geometry capture (tf_auto, g_tf_gpu_draw) does not wait: its count, written by the capture kernel (geo_tf), is read as the last finished
+    // submission left it, so particles born this frame show a frame late and those gone a frame longer. Xenoblade Chronicles 3 draws its GPU particles so; waiting for each
+    // (the whole submission so far committed and finished) took 3-12 ms of the replay thread per draw. The other waits are taken once per submission and GPU write epoch
+    // (g_wr_epoch, as mdi_wait's multi-draws), except for vertex data the CPU converts or the GPU wrote in this submission
+    int tfg = ind && g_tf_gpu_draw, hard = 0;
+    int wait = (ind && !tfg) || di0 != NULL;  // CPU assembly must also see writes from earlier submissions.
+    for (int i = 0; i < 16 && !tfg; i++) if (S.vbuf[i].size && pend_hits(S.vbuf[i].address, S.vbuf[i].size)) wait = hard = 1;
+    for (int i = 0; i < vs->rf.nv; i++) if (vconv_wanted(&vs->rf, i, NULL, 0)) wait = hard = 1;
+    g_geo_st[0]++; if (tfg) g_geo_st[3]++;
     if (defer_has_active()) defer_fallback();
     lc_land(); rp_flush(); rp_end(); ubd_land();
-    if (wait) { mdi_wait(); if (g_mdi_ev.signaledValue < g_mdi_v) return; memset(g_vconv, 0, sizeof g_vconv); }
+    if (wait && !hard && g_mdi_sub != g_sub_serial && __atomic_load_n(&g_done, __ATOMIC_ACQUIRE) >= g_fence) { g_mdi_sub = g_sub_serial; g_mdi_epoch = g_sub_wr0; }   // earlier submissions finished: as a wait when this one began
+    if (wait && !hard && g_mdi_epoch == g_wr_epoch && g_mdi_sub == g_sub_serial) { wait = 0; g_geo_st[2]++; }
+    if (wait) { mdi_wait(); g_mdi_epoch = g_wr_epoch; g_mdi_sub = g_sub_serial; g_geo_st[1]++; if (g_mdi_ev.signaledValue < g_mdi_v) return; memset(g_vconv, 0, sizeof g_vconv); }
     if (ind) {
         uint32_t a[5] = {0}; size_t n = dw0 ? 16 : 20;
         if (!nvn_host_readable(ind, n)) { MLOG("[RED] geometry indirect arguments are not readable"); return; }

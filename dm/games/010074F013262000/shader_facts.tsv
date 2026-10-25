@@ -15,6 +15,7 @@
 4bae5b8abd3bec7f	{"fout":{"0":"uint","1":"uint"}}
 531d637463e53486	{"fout":{"2":"uint"}}
 5abc9844d234bcae	{"local":[16,16,1],"shared":11280}
+6ff786dd43291c03	{"fout":{"3":"uint"}}
 885bb4caecc378cf	{"fout":{"0":"uint","1":"uint"}}
 8cabe1ed395bddbd	{"local":[16,1,1],"shared":80}
 9417c75269b574ae	{"local":[64,1,1],"shared":0}
