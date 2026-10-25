@@ -28,7 +28,7 @@ zip_store	.ard:.arh:.pck:.webm:.metallib
 # ---- Memory ----
 # The game reserves a 60 GB virtual address region for its own allocator; patches.py cuts it to 4 GB (0.75 GB small-object arena, then large-block chunks) and dm/tools/sdk_patches.py cuts
 # the SDK's node area to 62 MB and the region's 1 GB alignment to 32 MB, so the region starts at alias +64 MB, followed by the 64 MB reserve region. The large-block allocator
-# never returns addresses to its region: once the region is used up, new chunks go to extra address regions the host allocates (dm/host/hle_monolib_alloc.c), 512 MB each,
+# never returns addresses to its region: once the region is used up, the host grows it over extra address regions above it (dm/host/hle_monolib_alloc.c), 512 MB each,
 # so the alias region is 4.875 GB (a 5.5 GB reservation; one block of 6 GB was proven on a phone, 7 GB fails)
 mem_reserve	0x160000000
 mem_alias	0x138000000

@@ -59,9 +59,11 @@ Patch offsets are in [dm/tools/patch_nso.py](../dm/tools/patch_nso.py) under the
 | +0 .. +62 MB | sdk AddressRegionManager node area (cut from 1 GB at `0x346430` / `0x3464cc`) |
 | +64 MB .. +4.06 GB | The game's virtual address region, 4 GB (`0xfa188c`): small-object arena 0.75 GB (`0xf55010`–`0xf55088`), then 3.25 GB of large-block chunks |
 | +4.06 .. +4.125 GB | The game's 64 MB emergency reserve region |
-| +4.125 .. +4.375 GB | Headroom |
+| +4.19 GB .. +4.875 GB | Extra address regions of 512 MB the region grows over once it is used up (`mem_alias` 4.875 GB) |
 
-The physical RAM probe is bypassed at `0xf56c94` (reports 2.5 GB). Last run: 2.8 million small allocations, none failed; 48 large ones failed, all 65 MB (class 42), right after the opening movie was opened. The memory comment in `game.tsv` still describes an older split.
+The physical RAM probe is bypassed at `0xf56c94` (reports 2.5 GB).
+
+The large-block allocator never gives addresses back to its region (a freed chunk stays in its size bucket, unmapped), so after enough churn the 4 GB region is used up even with physical memory to spare: the opening movie's 128 MB chunk, new maps' terrain (193 MB; the player fell through the ground) and character data failed. The stub at `0xf56234` (`patches.py` `STUBS`, observation gate 31, [hle_monolib_alloc.c](../dm/host/hle_monolib_alloc.c)) takes an address region of 512 MB with `nn::os::AllocateAddressRegion` above the region, moves the region's offset to it and its size to its end, and the allocator bumps again. Two earlier versions failed: taking chunks back from the buckets left descriptors out of address order (crash in `0xfa19cc`); serving chunks from outside the region played the movie but crashed at its end in the movie heap's free (`0xf9bad8`), because `operator delete` and the chunk queries (`0xf54320`, `0xfa1ca4`..) treat anything outside [base, base + size) as another allocator's.
 
 ## Diagnostics added during the bring-up
 
@@ -83,7 +85,7 @@ From the iPhone log of `dca4729` (2026-10-25): every shader in the map, 22,528 o
 |---|---|---|---|---|
 | 1 | **Done, to confirm on the device** (`OP_TF_DRAW`, `tf_auto` in `nvn_mtl.m`). **`nvnCommandBufferDrawTransformFeedback`.** Upstream records the captures but its `DrawTransformFeedback` is an empty function (`[RED] DrawTransformFeedback: drawing the captured vertex count is not implemented`). End / Pause keep the bytes captured under the control buffer's address; the draw then draws bytes / stride vertices, stride being that of the vertex stream attribute 0 reads (an `OP_TF_DRAW` replayed as a plain array draw) | The characters: their skinned vertices are captured, and the draws that read them are these (34 a run in the old branch's logs) | Small | Characters drawn |
 | 2 | **Geometry shader with transform feedback** (`[RED] geometry draw cannot capture this pipeline (… geometry c01e3ade8e15a842, feedback 1)`, 8 a run): the compute replay of the geometry stage does not write feedback buffers. Capture the geometry stage's output vertices in `nvn_geometry.inc` the way `vs_tf` does for a vertex shader | One effect (`cmn_assets.wipac`'s point-to-quad shader) drawn while a capture is active | Medium | No such red line |
-| 3 | **Opening movie memory.** At the first failure the large-block allocator had handed out 4,045 MB: class 47 1,690 MB (4 GPU pools of about 420 MB), class 28 1,354 MB (2,704 blocks of about 512 KB; frees are not seen), class 46 277 MB, then many small classes. Next: log large-block frees too (find the free path beside `main+0xf55764`) to see what is held, not handed out; then shrink the 0.75 GB small-object arena if its peak is low, or make the allocator give class-28 chunks back | The 65 MB blocks the movie player asks for (`main+0xfa1bb0`, through `main+0xf542a0`) fail 49 times right after the movie is opened | Medium | Movie on screen, `large … / 0 failed` |
+| 3 | **Done, to confirm on the device.** **Large-block address region used up** (layout above): the region grows over extra address regions | The opening movie, new maps' terrain, characters | Medium | Movie, its end, terrain in the second map |
 | 4 | The one SPIR-V failure: `Subgroup builtins are not available in this type of function` (`dmsh_build.log`) | | Small | Builds |
 | 5 | UI boxes drawn black (enemy HP bar's right half, portrait frames, counters; seen before the move to upstream): check again on `xc3` | | Diagnosis | |
 
