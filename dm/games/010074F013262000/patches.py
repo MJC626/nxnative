@@ -1,6 +1,6 @@
 # Xenoblade Chronicles 3 (010074F013262000): the rewriter's patches of this game's own builds. dm/tools/patch_nso.py loads every profile's patches.py and applies those of a module's NSO build ID;
 # CUTS, OBS and FRAME_STEP as described there ("Registered patches"). Patches of Nintendo SDK module builds are in dm/tools/sdk_patches.py (this game's sdk: the node area and region alignment cuts)
-from nso_asm import B, CBZ
+from nso_asm import B, BEQ, CBZ, CMPI
 CUTS = {
   # Xenoblade Chronicles 3 1.0.0 (v0) main: virtual address region reservation 60 GB (0xf00000000) → 4 GB (0x100000000),
   # internal dynamic allocation arena 4 GB (0x100020000) → 0.75 GB (0x30020000),
@@ -73,15 +73,21 @@ OBS = {
 # kept, never to the region. On the Switch the region is 60 GB and never runs out; at 4 GB the offset reached the end after the buckets' peaks (512 KB chunks alone peaked at
 # 1.3 GB), and every later new chunk failed: the 65 MB the opening movie asks for, the 193 MB of a new map's terrain (the player fell through the ground), 16 MB character data.
 # The stub: where the offset would pass the end (the failure path at main+0xf56234, reached from the bound check at +0xf56148), observation callback 31 (dm/host/hle_monolib_alloc.c)
-# grows the region over an extra address region above it (the offset moves to its start, the end to its end); with one, the allocator takes the chunk again from the top
-# (main+0xf5611c), so every check against the region (main+0xf54320: operator delete's routing, the chunk queries at main+0xfa1ca4..) covers the new chunks
+# first joins a run of free chunks lying side by side in the buckets into one chunk of the size asked for (its first descriptor takes the size and class, the others leave their
+# buckets; no descriptor moves, so their order by address stays), and the allocator goes on as with a chunk taken from its bucket (main+0xf56060: x28 = the descriptor, the
+# allocator's lock released). Without such a run it grows the region over an extra address region above it (the offset moves to its start, the end to its end), and the allocator
+# takes the chunk again from the top (main+0xf5611c), so every check against the region (main+0xf54320: operator delete's routing, the chunk queries at main+0xfa1ca4..) covers it
 def _stubs_v0(ctx):
     ctx.site(0xf56234, 'e00319aa')   # mov x0, x25: the failure path's first instruction (unlock the allocator, return 0)
     st = ctx.here()
-    ctx.gate(31)                     # host: x0 = 1 when the region grew, or x0 = 0
-    ctx.emit(CBZ(ctx.here(), ctx.here() + 8, 0))
+    ctx.gate(31)                     # host: x0 = 2 with x28 = a joined chunk's descriptor (lock x25 released), 1 when the region grew, 0 = no room
+    fail = ctx.here() + 20
+    ctx.emit(CBZ(ctx.here(), fail, 0))
+    ctx.emit(CMPI(0, 1))
+    ctx.emit(BEQ(ctx.here(), ctx.here() + 8) | 1)    # b.ne: a joined chunk
     ctx.emit(B(ctx.here(), 0xf5611c))                # the bump again (x20 = allocator, x21 = class, x25 = its lock, held)
+    ctx.emit(B(ctx.here(), 0xf56060))                # a chunk from a bucket (x19 = the bucket's lock, x27 = its list, w23 = bytes to map now)
     ctx.emit(0xaa1903e0)             # mov x0, x25 (the original instruction)
     ctx.emit(B(ctx.here(), 0xf56238))
-    ctx.put(0xf56234, [B(0xf56234, st)], 'large-block allocator, address region used up: the region grows over an extra one (dm/host/hle_monolib_alloc.c)')
+    ctx.put(0xf56234, [B(0xf56234, st)], 'large-block allocator, address region used up: free chunks joined, or the region grows over an extra one (dm/host/hle_monolib_alloc.c)')
 STUBS = {'60887a25b66529910275a1066003a002': _stubs_v0}

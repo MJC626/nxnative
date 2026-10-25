@@ -108,6 +108,7 @@ static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_done;                         // Highest completed fence value (written by the completion callback)
 static uint64_t g_arena_made;
 static int g_allocprof = -1; static uint64_t g_ap_bytes[64], g_ap_fn[8];
+static int g_opprof = -1; static uint64_t g_op_ns[64], g_op_cnt[64];   // DM_NVN_OPPROF=1: replay CPU time by operation type (mtl_opprof_report)
 #define AP_B uint64_t _ap0 = g_allocprof > 0 ? g_dev.currentAllocatedSize : 0
 #define AP_E(i) do { if (g_allocprof > 0) { uint64_t _n = g_dev.currentAllocatedSize; if (_n > _ap0) g_ap_fn[i] += _n - _ap0; } } while (0)   // Per-frame arenas created so far (4 MiB each; for the memory report)
 static _Atomic int g_last_commit_error;
@@ -540,6 +541,7 @@ static int vis_in_ring(id<MTLBuffer> b) { for (int i = 0; i < g_vis_ring_n; i++)
 static int g_vis_on, g_vis_counting, g_vis_cur = -1; static uint64_t g_vis_cur_pass;
 static vis_slot *g_vs; static int g_nvs, g_vscap;      // Slots since the last reset
 static uint64_t g_cnt_report[32], g_cnt_reset[32];       // Report / reset counts per counter type (diagnostics)
+static _Atomic uint64_t g_sp_zero, g_sp_some;              // samples-passed results written as 0 / more than 0 (mtl_counter_report)
 static void vis_clear(void) { for (int i = 0; i < g_nvs; i++) CFRelease(g_vs[i].buf); g_nvs = 0; g_vis_cur = -1; }
 static vis_list *vis_snapshot(void) {
     vis_list *l = malloc(sizeof *l + g_nvs * sizeof(vis_slot)); l->n = g_nvs;
@@ -1090,6 +1092,15 @@ static void post(post_op o) {
 void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v) { post((post_op){1, val, mode, v, 0, 0, NULL}); }
 void mtl_sub_counter(uint64_t addr, uint32_t type) { sbw_note(addr, 16, SBW_REPORT); post((post_op){2, NULL, 0, 0, addr, type, NULL, g_seg}); }
 void mtl_counter_stats(uint64_t rep[32], uint64_t rst[32]) { memcpy(rep, g_cnt_report, sizeof g_cnt_report); memcpy(rst, g_cnt_reset, sizeof g_cnt_reset); }
+// With the 300-frame report: counter reports per frame by type (NVNcounterType: 0 timestamp, 1 samples passed, 0x10 timestamp top; the others are written as 0) and the
+// samples-passed results written as 0 or more, for culling the game decides on the GPU's counts
+void mtl_counter_report(uint64_t frame) {
+    static uint64_t prep[32], pz, ps, pf; uint64_t z = atomic_load(&g_sp_zero), sm = atomic_load(&g_sp_some);
+    if (pf && frame > pf) { char b[400]; int n = 0; double nf = (double)(frame - pf);
+        for (int t = 0; t < 32 && n < 360; t++) if (g_cnt_report[t] > prep[t]) n += snprintf(b + n, sizeof b - n, " type %#x %.1f", t, (g_cnt_report[t] - prep[t]) / nf);
+        if (n) MLOG("counter reports per frame up to frame %llu:%s; samples passed written as 0: %llu, more than 0: %llu", frame, b, (unsigned long long)(z - pz), (unsigned long long)(sm - ps)); }
+    memcpy(prep, g_cnt_report, sizeof prep); pz = z; ps = sm; pf = frame;
+}
 
 // Counter timestamps (19.2 MHz) are taken from the guest clock (hle_os.c guest_ns, the same source as svc GetSystemTick / cntpct): on hardware GPU timestamps and the CPU counter share one timebase, and games compare them.
 // They used to come from CLOCK_MONOTONIC, which keeps running while the Mac sleeps while the guest clock (mach_absolute_time) does not, so the two differed by the sleep time; once timestamps were converted to ns, Mario halved its frame rate. In graphics unit tests guest_ns is a weak definition returning 0; fall back to the monotonic clock
@@ -1241,7 +1252,7 @@ uint64_t mtl_sub_commit(void) {
             else if (ops[i].kind == 3) {   // Samples passed: the sum of all slots since the reset
                 vis_list *l = ops[i].vis; uint64_t sum = 0;
                 for (int k = 0; k < l->n; k++) { sum += ((const uint64_t *)((__bridge id<MTLBuffer>)l->s[k].buf).contents)[l->s[k].slot]; CFRelease(l->s[k].buf); }
-                free(l); uint64_t rec[2] = {sum, gpu_ticks()}; memcpy((void *)ops[i].addr, rec, sizeof rec);
+                free(l); uint64_t rec[2] = {sum, gpu_ticks()}; memcpy((void *)ops[i].addr, rec, sizeof rec); atomic_fetch_add(sum ? &g_sp_some : &g_sp_zero, 1);
             }
             else { uint64_t t = rep_ticks(&ops[i], sc, seg_last, c0, c1), rec[2] = {(ops[i].type == 0 || ops[i].type == 0x10) && !DM_GAME_RENDER_COND ? t : 0, t}; memcpy((void *)ops[i].addr, rec, sizeof rec); }   // render_cond: a timestamp report's counter field is 0, as on the GPU (see rc_value)
         }
@@ -2143,6 +2154,27 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
         MLOG("GPU allocation growth by function: pass end %llu MB, pass begin %llu MB, pipeline fetch %llu MB, argument buffers %llu MB, texture fetch %llu MB", g_ap_fn[0] >> 20, g_ap_fn[1] >> 20, g_ap_fn[2] >> 20, g_ap_fn[3] >> 20, g_ap_fn[4] >> 20); }
     if (g_allocprof > 0) { int top[4] = {-1, -1, -1, -1}; for (int o = 0; o < 64; o++) for (int k = 0; k < 4; k++) if (top[k] < 0 || g_ap_bytes[o] > g_ap_bytes[top[k]]) { for (int j = 3; j > k; j--) top[j] = top[j - 1]; top[k] = o; break; }
         MLOG("GPU allocation growth by op: op%d %llu MB, op%d %llu MB, op%d %llu MB, op%d %llu MB", top[0], g_ap_bytes[top[0]] >> 20, top[1], g_ap_bytes[top[1]] >> 20, top[2], g_ap_bytes[top[2]] >> 20, top[3], g_ap_bytes[top[3]] >> 20); }
+}
+void mtl_opprof_report(uint64_t frame) {   // DM_NVN_OPPROF=1, with the 300-frame report
+    static const char *nm[OP_COUNT_] = { [OP_COPY_B2B] = "copy buffer", [OP_UPDATE_UB] = "uniform update", [OP_SET_RT] = "set targets", [OP_CLEAR_COLOR] = "clear color", [OP_CLEAR_DS] = "clear depth",
+        [OP_BIND_PROGRAM] = "bind program", [OP_BIND_STATE] = "bind state", [OP_BIND_VBUF] = "bind vertex buffers", [OP_BIND_UBO] = "bind uniform buffer", [OP_BIND_SSBO] = "bind storage buffer",
+        [OP_BIND_TEX] = "bind textures", [OP_BIND_SAMP] = "bind samplers", [OP_DRAW] = "draw", [OP_DRAW_IDX] = "indexed draw", [OP_DISPATCH] = "dispatch", [OP_BARRIER] = "barrier",
+        [OP_COPY_B2T] = "copy buffer to texture", [OP_COPY_T2B] = "copy texture to buffer", [OP_COPY_T2T] = "copy texture", [OP_BIND_IMG] = "bind images", [OP_CLEAR_TEX] = "clear texture",
+        [OP_CLEAR_BUF] = "clear buffer", [OP_CALL] = "call", [OP_SIGNAL_EVENT] = "signal", [OP_REPORT_COUNTER] = "report counter", [OP_TF_BIND] = "feedback bind", [OP_TF_STATE] = "feedback state",
+        [OP_TF_DRAW] = "feedback draw", [OP_RAST_DISCARD] = "rasterizer discard", [OP_BIND_TEX1] = "bind texture" };
+    static uint64_t pns[64], pcnt[64], pf;
+    if (g_opprof <= 0) return;
+    if (pf && frame > pf) {
+        double nf = (double)(frame - pf), all = 0; int top[8]; for (int k = 0; k < 8; k++) top[k] = -1;
+        for (int o = 0; o < 64; o++) { uint64_t d = g_op_ns[o] - pns[o]; all += d;
+            for (int k = 0; k < 8; k++) if (top[k] < 0 || d > g_op_ns[top[k]] - pns[top[k]]) { for (int j = 7; j > k; j--) top[j] = top[j - 1]; top[k] = o; break; } }
+        char b[600]; int n = 0;
+        for (int k = 0; k < 8 && top[k] >= 0 && n < 560; k++) { int o = top[k]; uint64_t d = g_op_ns[o] - pns[o], c = g_op_cnt[o] - pcnt[o]; if (!d) break;
+            char on[16]; snprintf(on, sizeof on, "op %d", o);
+            n += snprintf(b + n, sizeof b - n, "%s %s %.2f ms (%.0f, %.1f us each)", k ? ";" : "", o < OP_COUNT_ && nm[o] ? nm[o] : on, d / 1e6 / nf, c / nf, c ? d / 1e3 / c : 0); }
+        MLOG("replay CPU by operation up to frame %llu: %.2f ms per frame in all;%s", frame, all / 1e6 / nf, b);
+    }
+    memcpy(pns, g_op_ns, sizeof pns); memcpy(pcnt, g_op_cnt, sizeof pcnt); pf = frame;
 }
 void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = g_pkg_uploads; *reuploads = g_pkg_reuploads; }
 uint64_t mtl_pkg_edge_skips(void) { return g_pkg_edge_skips; }
@@ -7862,6 +7894,11 @@ void mtl_exec(const uint8_t *p) {
         // Diagnostic DM_NVN_ALLOCPROF=1: growth of the GPU allocated size is charged to the previous operation's type (rough: allocations on other threads are counted too); the memory report line appends the top 4
         if (g_allocprof < 0) g_allocprof = getenv("DM_NVN_ALLOCPROF") != NULL;
         if (g_allocprof) { static uint64_t last; static int prev = -1; uint64_t now = g_dev.currentAllocatedSize; if (prev >= 0 && prev < 64 && now > last) g_ap_bytes[prev] += now - last; last = now; prev = h.op; }
+        // Diagnostic DM_NVN_OPPROF=1: the time from one operation to the next is charged to the first (a pass end, pipeline fetch or upload inside it included; a sub-list's operations to
+        // themselves, its call only up to the first); every 300 frames the top operations by CPU time per frame (mtl_opprof_report)
+        if (g_opprof < 0) g_opprof = getenv("DM_NVN_OPPROF") != NULL;
+        if (g_opprof) { static uint64_t last; static int prev = -1; uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); if (prev >= 0) { g_op_ns[prev] += now - last; g_op_cnt[prev]++; }
+                        last = now; prev = h.op == OP_END ? -1 : h.op < 64 ? (int)h.op : 63; }
         if (g_hoist_n && hoist_take(p)) { if (g_fz.active && p == g_fz.rt2_op) { g_fz.phase = 2; g_rt_merged = 0; PD("F %llu merged pass enters the later pass's draws", g_stat_pass); } p += h.size; continue; }   // A pure-clear render pass already executed early / the start of a later pass already merged in   // Entering the later pass: the same-target continuation of the earlier pass ends here; the later pass reading the earlier pass's attachment is proven to be same-pixel by fz_p2_draw, and is no longer split by the continuation rule
         const void *a = p + 8;
         if (g_nlc && !lc_keeps(h.op) && !(h.op == OP_END && g_ret_n)) lc_land();   // see lc_keeps (a sub-list's end returns to its caller)

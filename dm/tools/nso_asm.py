@@ -19,6 +19,7 @@ def ADDI(dd, n, imm12, sh=0): return 0x91000000 | (sh << 22) | (imm12 << 10) | (
 def ADDR(dd, n, m): return 0x8B000000 | (m << 16) | (n << 5) | dd
 def SUBI(dd, n, imm12, sh=0): return 0xD1000000 | (sh << 22) | (imm12 << 10) | (n << 5) | dd
 def BR(n): return 0xD61F0000 | (n << 5)
+def CMPI(n, imm12): return 0xF100001F | (imm12 << 10) | (n << 5)   # cmp xn, #imm12 (subs xzr)
 def CMPR(n, m): return 0xEB00001F | (m << 16) | (n << 5)   # cmp xn, xm (subs xzr)
 def BEQ(frm, to):
     off = to - frm; assert -(1 << 20) <= off < (1 << 20) and off % 4 == 0
