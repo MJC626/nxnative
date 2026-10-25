@@ -45,6 +45,7 @@ static void sp_hit(uint64_t obj, uint32_t res) {
             g_sp[i].reported = g_sp[i].n;
         }
         snd_report();
+        void monolib_alloc_report(void); monolib_alloc_report();   // hle_monolib_alloc.c
         if (atomic_load(&g_hp_obj)) LOG("state poll: heap %#llx: %.1f MB in use, peak %.1f MB", (unsigned long long)atomic_load(&g_hp_obj), atomic_load(&g_hp_now) / 1048576.0, atomic_load(&g_hp_peak) / 1048576.0);
         LOG("state poll: guest allocations so far: small %llu ok / %llu failed, large %llu ok / %llu failed", (unsigned long long)g_al_ok[0], (unsigned long long)g_al_fail[0], (unsigned long long)g_al_ok[1], (unsigned long long)g_al_fail[1]);
     }

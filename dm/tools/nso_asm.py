@@ -23,6 +23,8 @@ def CMPR(n, m): return 0xEB00001F | (m << 16) | (n << 5)   # cmp xn, xm (subs xz
 def BEQ(frm, to):
     off = to - frm; assert -(1 << 20) <= off < (1 << 20) and off % 4 == 0
     return 0x54000000 | (((off >> 2) & 0x7FFFF) << 5)
+def CBZ(frm, to, t):   # cbz xt, to
+    d = (to - frm) // 4; assert -(1 << 18) <= d < (1 << 18), f'cbz out of range {frm:#x} -> {to:#x}'; return 0xB4000000 | ((d & 0x7FFFF) << 5) | t
 def BRK(imm): return 0xD4200000 | ((imm & 0xFFFF) << 5)
 def BLR(n): return 0xD63F0000 | (n << 5)
 NOP = 0xD503201F

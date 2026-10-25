@@ -66,9 +66,10 @@ else:
 #   OBS = {build ID: [(offset, number, original instruction word, reason)]}: observation gates. Numbers match OBS_* in the host's hle.h; the original instruction must be position
 #     independent (no PC-relative / branch / anything involving x18 or tpidr), asserted offline; when the host has no callback attached the gate block goes in and out once and returns
 #   FRAME_STEP = {build ID: function(ctx)}: the frame step stubs of a main ("Frame step in whole vsyncs" below)
+#   STUBS = {build ID: function(ctx)}: code of the patch file's own in the patch area, which may call the host through an observation gate ("Stubs" below)
 PATCH_FILES = [os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sdk_patches.py')] + sorted(glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), '../games/*/patches.py')))
 def load_patches():
-    tables, where = {'CUTS': {}, 'OBS': {}, 'FRAME_STEP': {}}, {}
+    tables, where = {'CUTS': {}, 'OBS': {}, 'FRAME_STEP': {}, 'STUBS': {}}, {}
     for n, path in enumerate(PATCH_FILES):
         spec = importlib.util.spec_from_file_location(f'patches_{n}', path); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
         for kind, table in tables.items():
@@ -903,6 +904,28 @@ if BUILD_ID in FRAME_STEP and NAME == 'main':
 if FS_STATE_OFF:   # the build's stubs (FRAME_STEP of its patches.py)
     fs = types.SimpleNamespace(here=here, emit=emit, site=fs_site, put=fs_put, state=FS_STATE_OFF, render_scale=0)
     FRAME_STEP[BUILD_ID](fs); RENDER_SCALE = fs.render_scale
+
+# ---- Stubs (a patch file's STUBS = {build ID: function(ctx)}) ----
+# Code in the patch area that a cut branches to, for a change one instruction cannot hold: ctx.here() / ctx.emit(word) assemble, ctx.site(offset, original bytes) asserts a site of the module
+# and that it is no rewrite site, ctx.put(offset, words, reason) writes it (listed with the cuts), ctx.gate(number) emits a gate block calling observation callback <number> (OBS_* in the
+# host's dm.h). The callback gets every saved register and _dm_gate reads x0..x29 back (x18 aside), so it may return values in any of them; the block keeps x29 / x30
+STUBS = PATCHES['STUBS']
+if BUILD_ID in STUBS:
+    def st_site(off, orig):
+        ob = bytes.fromhex(orig)
+        assert IMG[off:off + len(ob)] == ob, f'stub site original bytes mismatch {off:#x}: {bytes(IMG[off:off + len(ob)]).hex()}'
+        for o in range(off, off + len(ob), 4):
+            assert o not in kinds and not any(seg[0].address <= o < seg[-1].address + 4 for seg in windows), f'stub site is a rewrite site {o:#x}'
+    def st_put(off, words, why):
+        old = bytes(IMG[off:off + 4 * len(words)])
+        for i, w in enumerate(words): struct.pack_into('<I', IMG, off + 4 * i, w)
+        cuts.append((off, old.hex(), bytes(IMG[off:off + 4 * len(words)]).hex(), why)); stat('stub')
+    def st_gate(oid):
+        start = here()
+        emit(STP_PRE(29, 30, 31, -16)); emit_gate_call(); emit(BLR(30))
+        ret = here(); emit(LDP_POST(29, 30, 31, 16))
+        gates.append((ret, 'obs', oid, start))
+    STUBS[BUILD_ID](types.SimpleNamespace(here=here, emit=emit, site=st_site, put=st_put, gate=st_gate))
 
 # ---- Spin waits (every module) ----
 # A guest loop that polls memory until another thread changes it fills only its own core on the Switch, where any higher-priority thread pinned there preempts it, so the

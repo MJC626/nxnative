@@ -1,5 +1,6 @@
 # Xenoblade Chronicles 3 (010074F013262000): the rewriter's patches of this game's own builds. dm/tools/patch_nso.py loads every profile's patches.py and applies those of a module's NSO build ID;
 # CUTS, OBS and FRAME_STEP as described there ("Registered patches"). Patches of Nintendo SDK module builds are in dm/tools/sdk_patches.py (this game's sdk: the node area and region alignment cuts)
+from nso_asm import B, CBZ
 CUTS = {
   # Xenoblade Chronicles 3 1.0.0 (v0) main: virtual address region reservation 60 GB (0xf00000000) → 4 GB (0x100000000),
   # internal dynamic allocation arena 4 GB (0x100020000) → 0.75 GB (0x30020000),
@@ -66,3 +67,20 @@ OBS = {
     (0xf5585c, 29, '8b1b16c8', 'small-object allocation returned (main+0xf55a90; x0 = block or 0, x27 = size class, x25 = size); orig add x8, x22, x27, lsl #5'),
   ],
 }
+
+# The large-block allocator (main+0xf55fb4) keeps a list of free chunks per size bucket and takes new chunks from the 4 GB address region by moving one offset forward
+# (main+0xf5611c: [region+8] += chunk size, 64 KB aligned, up to [region+0x18]); a freed chunk goes back to its own bucket's list with its memory unmapped and its addresses
+# kept, never to the region. On the Switch the region is 60 GB and never runs out; at 4 GB the offset reached the end after the buckets' peaks (512 KB chunks alone peaked at
+# 1.3 GB), and every later new chunk failed: the 65 MB the opening movie asks for, the 193 MB of a new map's terrain (the player fell through the ground), 16 MB character data.
+# The stub: where the offset would pass the end (the failure path at main+0xf56234, reached from the bound check at +0xf56148), observation callback 31 (dm/host/hle_monolib_alloc.c)
+# hands out addresses of other buckets' free chunks instead; with one, x11 = the chunk and the allocator goes on as after a new chunk (main+0xf56190)
+def _stubs_v0(ctx):
+    ctx.site(0xf56234, 'e00319aa')   # mov x0, x25: the failure path's first instruction (unlock the allocator, return 0)
+    st = ctx.here()
+    ctx.gate(31)                     # host: x0 = 1 with x11 = the chunk's address, or x0 = 0
+    ctx.emit(CBZ(ctx.here(), ctx.here() + 8, 0))
+    ctx.emit(B(ctx.here(), 0xf56190))                # the descriptor of a new chunk (x9 = its size, x8 = allocator + 0x38, x24 = class)
+    ctx.emit(0xaa1903e0)             # mov x0, x25 (the original instruction)
+    ctx.emit(B(ctx.here(), 0xf56238))
+    ctx.put(0xf56234, [B(0xf56234, st)], 'large-block allocator, address region used up: other buckets\' free chunks (dm/host/hle_monolib_alloc.c)')
+STUBS = {'60887a25b66529910275a1066003a002': _stubs_v0}
