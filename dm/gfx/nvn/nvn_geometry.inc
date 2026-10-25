@@ -19,9 +19,44 @@ static id<MTLRenderPipelineState> geo_capture_pso(NvShader *vs) {
     else { hm_put_id(&g_pso_fail, &k, NSNull.null); MLOG("[RED] geometry vertex capture %s: %s", vs->key, e.localizedDescription.UTF8String); }
     return ps;
 }
+// Transform feedback of a geometry shader (Xenoblade Chronicles 3's GPU particles: c01e3ade8e15a842 emits up to 16 points per input point and captures 11 outputs, 172 bytes a point, which
+// DrawTransformFeedback draws later). After the geometry compute and the index compaction, one thread copies the emitted vertices in emission order into feedback buffer 0, from the byte
+// count in the game's control buffer on, and leaves there the new count (+0) and the indirect arguments of DrawTransformFeedback (+16: vertices, 1, 0, 0; tf_auto). The emitted vertex record is
+// position (4 words), point size (1), then 4 words per output location in increasing order (Ryujinx's FillIoOffsetMap); a shader writing clip distances, a layer or other locations than the
+// ones it captures has a different record, which is not mapped (a red line, nothing captured)
+static const char k_geo_tf_msl[] =
+"#include <metal_stdlib>\nusing namespace metal;\n"
+"struct geo_tf { device const uint *src; device const uint *idx; device const uint *args; device uint *dst; device uint *ctl; uint stride_src, stride_dst, nout, cap; uint off[32]; uint cnt[32]; };\n"
+"kernel void geo_tf_capture(constant geo_tf& j [[buffer(0)]]) {\n"
+" uint n = j.args[0], at = j.ctl[0] / 4, room = at < j.cap ? (j.cap - at) / j.stride_dst : 0; if (n > room) n = room;\n"
+" for (uint i = 0; i < n; i++) { uint v = j.idx[i], w = at + i * j.stride_dst, k = 0;\n"
+"  for (uint o = 0; o < j.nout; o++) for (uint c = 0; c < j.cnt[o]; c++) j.dst[w + k++] = j.src[v * j.stride_src + j.off[o] + c]; }\n"
+" uint bytes = j.ctl[0] + n * j.stride_dst * 4; j.ctl[0] = bytes; j.ctl[4] = bytes / (j.stride_dst * 4); j.ctl[5] = 1; j.ctl[6] = 0; j.ctl[7] = 0;\n"
+"}\n";
+static void geo_tf(NvShader *base, NvShader *gs, uint64_t output, uint64_t packed, uint64_t args) {
+    static id<MTLComputePipelineState> ps;
+    if (!ps) { NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(k_geo_tf_msl) options:nil error:&e];
+        if (lib) ps = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"geo_tf_capture"] error:&e];
+        if (!ps) { RED_ONCE(112, "geometry transform feedback kernel: %s", e.localizedDescription.UTF8String); return; } }
+    int words = 0, sorted = 1; for (int o = 0; o < base->gtf_n; o++) { words += base->gtf_cnt[o]; if (o && base->gtf_loc[o] <= base->gtf_loc[o - 1]) sorted = 0; }
+    if (!sorted || gs->geo_stride != 5u + 4u * base->gtf_n || base->gtf_stride != 4 * words) {
+        { static int once; if (!once++) MLOG("[RED] geometry shader %s: its emitted vertex record (%u words) does not map onto its feedback layout (%d outputs, %u bytes): nothing captured", base->key, gs->geo_stride, base->gtf_n, base->gtf_stride); }
+        return; }
+    void *mb; uint64_t mo, dst = 0, ctl = 0;
+    if (!S.tf[0].addr || !S.tf[0].size || !mtl_gpu_addr(S.tf[0].addr, S.tf[0].size, &mb, &mo, &dst) || !S.tf_ctl || !mtl_gpu_addr(S.tf_ctl, 32, &mb, &mo, &ctl)) {
+        RED_ONCE(113, "geometry transform feedback: buffer 0 (%#llx, %llu bytes) or control buffer %#llx in no memory pool: nothing captured", (unsigned long long)S.tf[0].addr, (unsigned long long)S.tf[0].size, (unsigned long long)S.tf_ctl); return; }
+    struct { uint64_t src, idx, args, dst, ctl; uint32_t stride_src, stride_dst, nout, cap, off[32], cnt[32]; } j = {output, packed, args, dst, ctl, gs->geo_stride, (uint32_t)words, base->gtf_n, (uint32_t)(S.tf[0].size / 4)};
+    for (int o = 0; o < base->gtf_n; o++) { j.off[o] = 5 + 4 * o; j.cnt[o] = base->gtf_cnt[o]; }
+    id<MTLBuffer> jb; size_t jo = arena_alloc(sizeof j, &jb); memcpy((uint8_t *)jb.contents + jo, &j, sizeof j);
+    id<MTL4ComputeCommandEncoder> ce = enc_c_begin(NULL); enc_c_pso(ce, ps); enc_c_args(ce, jb.gpuAddress + jo, 0);
+    enc_c_dispatch(ce, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1)); enc_c_end(ce);
+    pend_add(S.tf[0].addr, S.tf[0].size, 4); pend_add(S.tf_ctl, 32, 4); S.tf_gpu = 1;
+    { static int once; if (!once++) MLOG("transform feedback: first capture of a geometry shader (%s, %d outputs, %u bytes a vertex)", base->key, base->gtf_n, base->gtf_stride); }
+    PD("T %llu tf capture geometry=%s (counted on the GPU)", g_stat_pass, base->key);
+}
 static void geo_draw(NvProg *pr, const p_draw *dw0, const p_draw_idx *di0) {
     NvShader *vs = pr->sh[0], *base = pr->sh[2];
-    if (!vs || !vs->geo_fn || !base || !base->geo_vertices || pr->sh[3] || pr->sh[4] || S.tf_on) {
+    if (!vs || !vs->geo_fn || !base || !base->geo_vertices || pr->sh[3] || pr->sh[4]) {
         MLOG("[RED] geometry draw cannot capture this pipeline (vertex %s, geometry %s, tessellation %d, feedback %d)", vs ? vs->key : "-", base ? base->key : "-", !!(pr->sh[3] || pr->sh[4]), S.tf_on); return;
     }
     p_draw dw = dw0 ? *dw0 : (p_draw){0}; p_draw_idx di = di0 ? *di0 : (p_draw_idx){0};
@@ -143,6 +178,7 @@ static void geo_draw(NvProg *pr, const p_draw *dw0, const p_draw_idx *di0) {
     enc_c_dispatch(ce, MTLSizeMake((np + 31) / 32, instances, gs->geo_invocations), MTLSizeMake(32, 1, 1)); enc_c_end(ce);
     ce = enc_c_begin(NULL); enc_c_pso(ce, pack); enc_c_args(ce, job, 0);
     enc_c_dispatch(ce, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1)); enc_c_end(ce);
+    if (S.tf_on && base->gtf_n) geo_tf(base, gs, output, packed, args);   // a capture (geo_tf); a geometry shader without a feedback layout is drawn as usual while a capture is active
     args_dirty_all(); g_enc_pso = nil; g_enc_dss = nil; g_ed.ok = 0;
     swrite_note(pr); udc_note_draw(pr); g_wr_epoch++; g_mdx_epoch++;
     if (S.rast_discard) return;

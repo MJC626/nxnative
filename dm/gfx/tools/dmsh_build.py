@@ -323,7 +323,7 @@ def job_for(key, name, rec, w):
         if any(code[0x30:0x100]): sys.exit(f'[RED] {key}: compute code area +0x30..+0x100 is not all zero, so the instructions do not start at +0x100')
         code = code[0x100:]
     cp = os.path.join(w, key + '.bin'); open(cp, 'wb').write(code)
-    tf = tf_layout(key, rec[ci:]) if stage == 'vs' else None
+    tf = tf_layout(key, rec[ci:]) if stage in ('vs', 'gs') else None   # a geometry shader's capture is done by the host after the geometry compute (nvn_geometry.inc geo_tf)
     j = {'key': key, 'stage': stage, 'code': cp, 'tex': {}, 'img': {}, 'attr': {}, 'fout': {}, 'c1': c1.hex(), **({'tf': tf} if tf else {}),
          'debug': os.environ.get('XLATE_DEBUG', '1') != '0', 'reduced': os.environ.get('XLATE_REDUCED', '1') == '1'}   # translation options (see dmsh_xlate/Program.cs); relaxed precision is on by default (GPU float last-bit error does not enter game state, whole frame −26% on the second Mac)   # c1: used by the translator to read indirect jump tables
     if key not in FACTS: j['no_facts'] = True; return j, c1   # not in the answer table: queries use defaults (listed separately in the summary)
@@ -783,7 +783,7 @@ def geometry_finish(key, w, j, c1):
                 'geometry': {'vertices': nv, 'invocations': inv, 'output': topology,
                              'stride': res['geometry_stride'], 'index_stride': nidx},
                 'c1': c1.hex(), 'notes': res['notes'], 'drv_reads': drv_reads(src), 'drv_unfillable': [],
-                'bindings': reflect(key, 'gs', src, res), 'vertex_inputs': [], 'raster': {}}
+                'bindings': reflect(key, 'gs', src, res), 'vertex_inputs': [], 'raster': {}, **({'tf_layout': j['tf']} if j.get('tf') else {})}
         def save(suffix, text, meta):
             path = os.path.join(out, key + suffix + '.metal'); open(path, 'w').write(text)
             MTL.compile('mac', path, os.path.join(out, key + suffix + '.metallib'))

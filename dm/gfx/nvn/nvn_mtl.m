@@ -1294,7 +1294,7 @@ void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); mtl_init
 
 // ================= Render replay =================
 #include "../../host/front.h"
-static int g_red_once[112];
+static int g_red_once[114];
 #define RED_ONCE(k, ...) do { if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -2914,6 +2914,7 @@ static void shmap_load(void) {
 @interface NvShader : NSObject { @public id<MTLFunction> fn, tf_fn, fn_u, fn_m, geo_fn; uint8_t mask_m;   // fn_u: the integer-output entry point (dmsh_build.py fs_uint), for pipelines whose colour attachments are all unsigned integer (pso_desc); fn_m: the mixed one, its outputs in mask_m unsigned integer
     uint16_t tf_stride[4]; uint32_t cb_ext[16], sb_ro; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, afr, layer_out; const char *builtin; uint64_t logged; char key[24]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
     uint32_t geo_vertices, geo_invocations, geo_output, geo_stride, geo_index_stride;
+    uint8_t gtf_n, gtf_loc[32], gtf_cnt[32]; uint16_t gtf_stride;   // a geometry shader's transform feedback buffer 0 (dmsh_build.py tf_layout): outputs (generic location, components), bytes per vertex
     id<MTLComputePipelineState> geo_pso;
     int gs_loc, lay_loc; char gs_comp, lay_comp;   // a slice-writing geometry shader (no function: the layer comes from input gs_loc.gs_comp) / a vertex shader with layer entry points writing output lay_loc.lay_comp (dmsh_build.py gs_slice, vs_layer_entry); -1 = none
     // The argument buffer encoded last time
@@ -3091,6 +3092,10 @@ static NvShader *shader_load(NSString *pc, int stage, int layer) {
     // A function that declares function constants cannot go into a pipeline until it is specialized, even when every constant is optional. SPIRV-Cross declares one for shaders that read a
     // texel buffer (spvLinearTextureAlignmentOverride, used only through is_function_constant_defined; one of Pokémon Legends: Z-A's imgui pixel shaders, 2bd5037003980716): an empty set of
     // values keeps its default. Without it the first pipeline with that shader failed Metal's validation (`fragmentFunction main0 cannot be used to build a pipeline state`)
+    { NSArray *tl = j[@"tf_layout"]; NSArray *b0 = tl.count ? tl[0] : nil;   // geometry: [[location, components], ..., stride] for buffer 0
+      if ([b0 isKindOfClass:NSArray.class] && b0.count >= 2 && b0.count <= 33) { o->gtf_stride = (uint16_t)[b0.lastObject unsignedIntValue];
+          for (NSUInteger i = 0; i + 1 < b0.count; i++) { NSArray *e = b0[i]; o->gtf_loc[o->gtf_n] = (uint8_t)[e[0] unsignedIntValue]; o->gtf_cnt[o->gtf_n] = (uint8_t)[e[1] unsignedIntValue]; o->gtf_n++; } }
+      for (NSUInteger b = 1; b < tl.count; b++) if ([tl[b] isKindOfClass:NSArray.class] && [tl[b] count]) MLOG("[RED] geometry shader %s captures into feedback buffer %lu: only buffer 0 is replayed", pc.UTF8String, (unsigned long)b); }
     if (j[@"entry_tf"]) {   // transform feedback capture entry point (dmsh_build.py vs_tf) and the bytes per vertex of each feedback buffer
         o->tf_fn = [lib newFunctionWithName:j[@"entry_tf"]]; NSArray *ts = j[@"tf_strides"];
         for (NSUInteger b = 0; b < 4 && b < ts.count; b++) o->tf_stride[b] = (uint16_t)[ts[b] unsignedIntValue];
@@ -3708,7 +3713,7 @@ static struct {
     uint32_t st_vmask[2], st_wmask[2], st_ref[2];
     p_poly_offset po; float vp[16][4]; float dr[2]; int has_vp; int depth_clamp; uint8_t vp_sw[16][4];   // vp_sw: viewport swizzles XOR the identity (p_vp_swizzle)
     float blend_color[4]; int64_t copy_stride, copy_img_stride;
-    p_tf_bind tf[4]; uint64_t tf_off[4], tf_verts; int tf_on, rast_discard;   // transform feedback buffers, bytes written into each since Begin, vertices captured since Begin, capture active; rasterizer discard (tf_draw)
+    p_tf_bind tf[4]; uint64_t tf_off[4], tf_verts, tf_ctl; int tf_on, rast_discard, tf_gpu;   // transform feedback buffers, bytes written into each since Begin, vertices captured since Begin, capture active; rasterizer discard (tf_draw)
     int tex_base, samp_base;   // host-table bases of the texture / sampler pool bound (OP_SET_TEX_POOL / OP_SET_SAMP_POOL), for handles read at replay from uniform buffers (encode_args)
 } S;
 // The handle c2 holds at byte b, as encode_args fills the table (DRV2): a combined slot (past slot 31 the image there, tex_slot_h), a separate texture, else none
@@ -5094,11 +5099,12 @@ int nvn_dpool_base(const void *pool, int tex);   // hle_nvn.c: where a descripto
 // each finished capture's bytes in buffer 0 and vertex count under its control buffer's address (End / Pause), and the draw becomes a plain array draw of that many vertices (tf_auto)
 static uint64_t g_rd_sets[2];   // SetRasterizerDiscard off / on replayed (rd_note)
 enum { TF_DONE = 32 };
-static struct { uint64_t ctl, bytes, verts; } g_tf_done[TF_DONE]; static int g_tf_ndone;
-static void tf_done_put(uint64_t ctl, uint64_t bytes, uint64_t verts) {
-    for (int i = 0; i < g_tf_ndone; i++) if (g_tf_done[i].ctl == ctl) { g_tf_done[i].bytes = bytes; g_tf_done[i].verts = verts; return; }
+// A capture a geometry shader made (geo_tf) is counted on the GPU: its bytes and the draw's indirect arguments are in the game's control buffer, and the draw reads them there (gpu)
+static struct { uint64_t ctl, bytes, verts; int gpu; } g_tf_done[TF_DONE]; static int g_tf_ndone;
+static void tf_done_put(uint64_t ctl, uint64_t bytes, uint64_t verts, int gpu) {
+    for (int i = 0; i < g_tf_ndone; i++) if (g_tf_done[i].ctl == ctl) { g_tf_done[i].bytes = bytes; g_tf_done[i].verts = verts; g_tf_done[i].gpu = gpu; return; }
     if (g_tf_ndone == TF_DONE) { memmove(g_tf_done, g_tf_done + 1, sizeof g_tf_done[0] * (TF_DONE - 1)); g_tf_ndone--; }
-    g_tf_done[g_tf_ndone++] = (typeof(g_tf_done[0])){ctl, bytes, verts};
+    g_tf_done[g_tf_ndone++] = (typeof(g_tf_done[0])){ctl, bytes, verts, gpu};
 }
 static int state_op(uint32_t op, const void *a) {
     switch (op) {
@@ -5160,8 +5166,9 @@ static int state_op(uint32_t op, const void *a) {
         case OP_COPY_STRIDE: { const p_copy_stride *cs = a; if (cs->image) S.copy_img_stride = cs->stride; else S.copy_stride = cs->stride; break; }
         case OP_TF_BIND: { const p_tf_bind *b = a; if (b->index >= 0 && b->index < 4) S.tf[b->index] = *b; break; }
         case OP_TF_STATE: { const p_tf_state *b = a;   // Begin writes from the start of each buffer; Pause / Resume keep the offsets (the host keeps them itself, the game's control buffer is not used)
-            if (b->what == 0) { S.tf_on = 1; memset(S.tf_off, 0, sizeof S.tf_off); S.tf_verts = 0; } else S.tf_on = b->what == 3;
-            if (b->what == 1 || b->what == 2) tf_done_put(b->ctl, S.tf_off[0], S.tf_verts);   // what DrawTransformFeedback with this control buffer draws (tf_auto)
+            if (b->what == 0) { S.tf_on = 1; memset(S.tf_off, 0, sizeof S.tf_off); S.tf_verts = 0; S.tf_gpu = 0; S.tf_ctl = b->ctl; } else S.tf_on = b->what == 3;
+            if (b->what == 3) S.tf_ctl = b->ctl;
+            if (b->what == 1 || b->what == 2) tf_done_put(b->ctl, S.tf_off[0], S.tf_verts, S.tf_gpu);   // what DrawTransformFeedback with this control buffer draws (tf_auto)
             break; }
         case OP_PRIM_RESTART: S.restart = *(const p_prim_restart *)a; break;
         case OP_RAST_DISCARD: S.rast_discard = ((const p_rast_discard *)a)->on; g_rd_sets[S.rast_discard != 0]++; PD("E %llu rasterizer discard %s", g_stat_pass, S.rast_discard ? "on" : "off"); break;
@@ -6826,8 +6833,14 @@ static void tf_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
 // DrawTransformFeedback as a plain array draw (see g_tf_done): the vertices the capture wrote; a capture whose vertex count is unknown (none recorded under this control buffer) gives its bytes
 // over the stride of the vertex stream attribute 0 reads, as the GPU divides the byte count by the draw's stride. → 0 when there is nothing to draw
 static int tf_auto(const p_tf_draw *x, p_draw *d) {
-    uint64_t bytes = 0, verts = 0; int found = 0;
-    for (int i = 0; i < g_tf_ndone; i++) if (g_tf_done[i].ctl == x->ctl) { bytes = g_tf_done[i].bytes; verts = g_tf_done[i].verts; found = 1; }
+    uint64_t bytes = 0, verts = 0; int found = 0, gpu = 0;
+    for (int i = 0; i < g_tf_ndone; i++) if (g_tf_done[i].ctl == x->ctl) { bytes = g_tf_done[i].bytes; verts = g_tf_done[i].verts; gpu = g_tf_done[i].gpu; found = 1; }
+    if (gpu) {   // counted by the GPU (geo_tf): an indirect draw of the arguments it wrote at control buffer + 16
+        memset(d, 0, sizeof *d); d->prim = x->prim; d->ind = x->ctl + 16; d->instances = 1;
+        { static int once; if (!once++) MLOG("transform feedback: first DrawTransformFeedback of a geometry shader's capture (indirect, control buffer %#llx)", (unsigned long long)x->ctl); }
+        PD("T %llu tf draw ctl=%#llx prim=%d indirect (geometry capture)", g_stat_pass, (unsigned long long)x->ctl, x->prim);
+        return 1;
+    }
     int st = S.attr[0].stream < 16 ? S.attr[0].stream : 0; uint32_t stride = S.stream[st].stride;
     if (!verts && bytes && stride) verts = bytes / stride;
     if (!found) RED_ONCE(111, "DrawTransformFeedback with control buffer %#llx: no capture ended under it, nothing drawn", (unsigned long long)x->ctl);
@@ -7921,7 +7934,7 @@ void mtl_exec(const uint8_t *p) {
                 state_op(h.op, a); break;
             case OP_TF_BIND: { const p_tf_bind *b = a; PD("Y tf bind %d addr=%#llx size=%llu", b->index, (unsigned long long)b->addr, (unsigned long long)b->size); state_op(h.op, a); break; }
             case OP_TF_STATE: { const p_tf_state *b = a; static const char *const w[4] = {"begin", "end", "pause", "resume"}; PD("Y tf %s ctl=%#llx written %llu/%llu/%llu/%llu", w[b->what & 3], (unsigned long long)b->ctl,
-                (unsigned long long)S.tf_off[0], (unsigned long long)S.tf_off[1], (unsigned long long)S.tf_off[2], (unsigned long long)S.tf_off[3]); state_op(h.op, a); break; }
+                (unsigned long long)S.tf_off[0], (unsigned long long)S.tf_off[1], (unsigned long long)S.tf_off[2], (unsigned long long)S.tf_off[3]); if (b->what == 0) mtl_sub_fill(b->ctl, 32, 0);   /* the control buffer's byte count and indirect arguments start at 0 (geo_tf), in order with the GPU work */ state_op(h.op, a); break; }
             case OP_PRIM_RESTART: state_op(h.op, a); break;
             case OP_RAST_DISCARD: PD("Y rasterizer discard %d", ((const p_rast_discard *)a)->on); state_op(h.op, a); break;
             case OP_COPY_B2T: copy_b2t(a); break;
