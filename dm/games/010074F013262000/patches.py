@@ -73,7 +73,7 @@ OBS = {
 # kept, never to the region. On the Switch the region is 60 GB and never runs out; at 4 GB the offset reached the end after the buckets' peaks (512 KB chunks alone peaked at
 # 1.3 GB), and every later new chunk failed: the 65 MB the opening movie asks for, the 193 MB of a new map's terrain (the player fell through the ground), 16 MB character data.
 # The stub: where the offset would pass the end (the failure path at main+0xf56234, reached from the bound check at +0xf56148), observation callback 31 (dm/host/hle_monolib_alloc.c)
-# hands out addresses of other buckets' free chunks instead; with one, x11 = the chunk and the allocator goes on as after a new chunk (main+0xf56190)
+# hands out a chunk in an extra address region above the allocator's own; with one, x11 = the chunk and the allocator goes on as after a new chunk (main+0xf56190)
 def _stubs_v0(ctx):
     ctx.site(0xf56234, 'e00319aa')   # mov x0, x25: the failure path's first instruction (unlock the allocator, return 0)
     st = ctx.here()
@@ -82,5 +82,5 @@ def _stubs_v0(ctx):
     ctx.emit(B(ctx.here(), 0xf56190))                # the descriptor of a new chunk (x9 = its size, x8 = allocator + 0x38, x24 = class)
     ctx.emit(0xaa1903e0)             # mov x0, x25 (the original instruction)
     ctx.emit(B(ctx.here(), 0xf56238))
-    ctx.put(0xf56234, [B(0xf56234, st)], 'large-block allocator, address region used up: other buckets\' free chunks (dm/host/hle_monolib_alloc.c)')
+    ctx.put(0xf56234, [B(0xf56234, st)], 'large-block allocator, address region used up: a chunk in an extra region (dm/host/hle_monolib_alloc.c)')
 STUBS = {'60887a25b66529910275a1066003a002': _stubs_v0}
