@@ -215,6 +215,7 @@ int mtl_tex_gpu_owned(uint64_t serial);                                  // its 
 // A program's per-stage shader key (hle_nvn.c): the first 8 bytes of sha256(first 0x880 bytes of the control section (its own length when shorter) + code area). Computed at SetShaders (NVN lets the caller free the control section once it returns, and Unity does);
 // a stage whose code area was not yet in any memory pool then is computed the first time it is asked for. Returns 0 = no such stage
 int prog_key(const prog_t *p, unsigned stage, uint8_t key[8]);
+int prog_code_key(const prog_t *p, unsigned stage, uint8_t key[8]);   // the code key of a stage (hle_nvn.c code_hash), 0 when not computed
 void mtl_reg_samp(int id, const samp_par *p);
 void mtl_prog_release(prog_t *p);
 // New serial (> 0, globally increasing)

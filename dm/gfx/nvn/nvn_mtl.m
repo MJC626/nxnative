@@ -1294,7 +1294,7 @@ void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); mtl_init
 
 // ================= Render replay =================
 #include "../../host/front.h"
-static int g_red_once[114];
+static int g_red_once[116];
 #define RED_ONCE(k, ...) do { if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -2853,6 +2853,7 @@ static pthread_mutex_t g_rmu = PTHREAD_MUTEX_INITIALIZER;
 // ---------- Shader mapping table: Switch control section hash → PC metallib (produced by dm/gfx/tools/shader_map.py) ----------
 static NSMutableDictionary<NSString *, NSArray *> *g_shmap;
 static NSString *g_shmap_path, *g_msl_dir;
+static NSMutableDictionary<NSString *, NSString *> *g_codeidx; static uint64_t g_codeidx_hits;   // code key → map key of a built shader with that code (code_index.tsv beside the libraries; prog_get)
 static NSString *exe_rel(const char *rel) {
     char buf[4096]; uint32_t n = sizeof buf;
     if (_NSGetExecutablePath(buf, &n)) return nil;
@@ -2879,6 +2880,10 @@ static void shmap_load(void) {
     if (![NSFileManager.defaultManager fileExistsAtPath:g_msl_dir]) MLOG("[RED] shader library directory %s does not exist: translation chain version %s of this source tree has not been built yet (dm/gfx/tools/dmsh_build.py)", g_msl_dir.UTF8String, DMSH_CHAIN);
     // The library's stamp (inputs.tsv, written by a full dmsh_build.py run): the game and the digest of the profile inputs it was built from. The chain version is the same for every
     // game and every state of a profile's tables, so the stamp is what ties c1_full.tsv / cb_extent.tsv to these libraries: each names the inputs of the library it was made from
+    { NSString *ci = [NSString stringWithContentsOfFile:[g_msl_dir stringByAppendingPathComponent:@"code_index.tsv"] encoding:NSUTF8StringEncoding error:nil];   // see prog_get
+      g_codeidx = [NSMutableDictionary dictionary];
+      for (NSString *ln in [ci componentsSeparatedByString:@"\n"]) { if (!ln.length || [ln hasPrefix:@"#"]) continue; NSArray *c = [ln componentsSeparatedByString:@"\t"]; if (c.count == 2) g_codeidx[c[0]] = c[1]; }
+      if (g_codeidx.count) MLOG("code index: %lu code keys (a shader missing from the map takes the library of one with the same code)", (unsigned long)g_codeidx.count); }
     NSString *stamp = [NSString stringWithContentsOfFile:[g_msl_dir stringByAppendingPathComponent:@"inputs.tsv"] encoding:NSUTF8StringEncoding error:nil], *st_game = nil, *st_inputs = nil;
     for (NSString *ln in [stamp componentsSeparatedByString:@"\n"]) {
         NSArray *c = [ln componentsSeparatedByString:@"\t"];
@@ -3230,6 +3235,11 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // Called only
         if (!stage) {   // Not in the package: look up the compute kernels embedded in the main body (nvn_builtin.h)
             NvShader *b = builtin_get(k.UTF8String);
             if (b) { o->sh[5] = b; continue; }
+            // The same code under another control section (Xenoblade Chronicles 3 makes programs at run time from its packs' code areas: hle_nvn.c prog_code_key): that shader's library
+            uint8_t ck[8]; NSString *k2 = g_codeidx.count && prog_code_key(p, i, ck) ? g_codeidx[[NSString stringWithFormat:@"%02x%02x%02x%02x%02x%02x%02x%02x", ck[0], ck[1], ck[2], ck[3], ck[4], ck[5], ck[6], ck[7]]] : nil;
+            if (k2 && g_shmap[k2]) { static int n; if (n++ < 100) MLOG("shader %s is not in the shader map: its code is that of %s, whose library is used", k.UTF8String, k2.UTF8String); g_codeidx_hits++; k = k2; stage = g_shmap[k2]; }
+        }
+        if (!stage) {
             MLOG("[RED] shader %s is not in the shader map (DM_NVN_SHDUMP=directory saves its control section and code area)", k.UTF8String);
             // DM_NVN_SHDUMP=directory: shaders missing from the map are saved as <key>.ctl (0x880-byte control section) and <key>.code (code area, length from control +0x704), to trace their source / add them to the map offline
             static const char *shd; static int shd_init; if (!shd_init) { shd = getenv("DM_NVN_SHDUMP"); shd_init = 1; if (shd) mkdir(shd, 0755); }   // e.g. DM_NVN_SHDUMP=shdump in the iPhone's Documents/env.txt
@@ -6786,6 +6796,30 @@ static void tf_stat(NvShader *vs, int captured, const p_draw *dw, uint64_t at) {
             tf_words("last capture, first vertex", g_tfst[k].key, g_tfst[k].at, g_tfst[k].words);
         } }
 }
+// A memory-writing vertex stage under rasterizer discard (vs_stores), any plain draw: array or 16 / 32-bit indexed, instanced or not (Xenoblade Chronicles 3 skins some models with indexed or
+// instanced draws, c0882609d8f91561: skipped, their skinned vertices stayed stale and drew as torn shapes). Each index runs the vertex stage once, as on the GPU (an index met twice writes twice)
+static void tf_store_draw(NvShader *vs, const p_draw *dw, const p_draw_idx *di) {
+    if ((dw && (dw->ind || dw->mdi_cnt)) || (di && (di->ind || di->mdi_cnt))) { RED_ONCE(114, "memory-writing vertex stage %s drawn indirectly under rasterizer discard: not run", vs->key); return; }
+    if (di && di->itype != 1 && di->itype != 2) { RED_ONCE(115, "memory-writing vertex stage %s drawn with 8-bit indices under rasterizer discard: not run", vs->key); return; }
+    int n = dw ? dw->count : di->count, inst = dw ? (dw->instances > 0 ? dw->instances : 1) : (di->instances ? di->instances : 1);
+    if (n <= 0) return;
+    void *mb = NULL; uint64_t mo = 0, igpu = 0;
+    if (di && !mtl_gpu_addr(di->ibuf, 1, &mb, &mo, &igpu)) { RED_ONCE(22, "index buffer is in no memory pool"); return; }
+    __unsafe_unretained id<MTLRenderPipelineState> ps = tf_pso(vs);
+    if (!ps) return;
+    rp_end(); ubd_land();   // as tf_draw
+    if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+    MTL4RenderPassDescriptor *d = [MTL4RenderPassDescriptor new]; d.renderTargetWidth = 1; d.renderTargetHeight = 1; d.defaultRasterSampleCount = 1;
+    id<MTL4RenderCommandEncoder> en = enc_r_begin(d);
+    enc_r_pso(en, ps); bind_vbufs(en); vconv_bind(en, vs, 1, dw, di);
+    args_dirty_all(); encode_args(en, vs, 0, 1);
+    if (di) enc_r_draw_indexed(en, MTLPrimitiveTypePoint, (NSUInteger)n, di->itype == 1 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32, igpu, ((__bridge id<MTLBuffer>)mb).length - mo, (NSUInteger)inst, di->base_vertex, (NSUInteger)di->base_instance);
+    else enc_r_draw_instanced(en, MTLPrimitiveTypePoint, (NSUInteger)dw->first, (NSUInteger)n, (NSUInteger)inst, (NSUInteger)dw->base_instance);
+    m4_end(en);
+    args_dirty_all(); g_enc_pso = nil; g_enc_dss = nil; g_ed.ok = 0;
+    { static int once; if (!once++) MLOG("rasterizer discard: first draw run for its vertex stage's memory writes (vertex %s, %d vertices x %d)", vs->key, n, inst); }
+    PD("T %llu vertex stage only (memory writes) vs=%s %s count=%d instances=%d", g_stat_pass, vs->key, di ? "indexed" : "array", n, inst);
+}
 static void tf_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
     __unsafe_unretained NvShader *vs = pr ? pr->sh[0] : nil;
     // A vertex shader that only writes memory (dmsh_build.py vs_stores: main0_tf with no feedback buffer; Xenoblade Chronicles 3's skinning into storage buffers) runs whether or not a
@@ -6793,6 +6827,7 @@ static void tf_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
     int stores_only = vs && vs->tf_fn && !(vs->tf_stride[0] | vs->tf_stride[1] | vs->tf_stride[2] | vs->tf_stride[3]);
     if (!S.tf_on && !stores_only) { if (vs && vs->tf_fn) tf_stat(vs, 0, dw, 0); rd_note(vs); PD("Z %llu draw skipped: rasterizer discard", g_stat_pass + !g_enc); return; }
     if (!vs || !vs->tf_fn) { rd_note(vs); RED_ONCE(100, "transform feedback with vertex shader %s, which has no capture entry point: nothing captured", vs ? vs->key : "-"); return; }
+    if (stores_only) { tf_store_draw(vs, dw, di); return; }
     if (!dw || dw->ind || dw->mdi_cnt || dw->instances > 1 || dw->prim == 6 || dw->prim == 7) { RED_ONCE(101, "transform feedback draw that is indexed, indirect, instanced or a fan / quad list (vertex %s): not captured", vs->key); return; }
     if (dw->count <= 0) return;
     uint64_t gpu[4] = {0};

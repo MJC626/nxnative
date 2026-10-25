@@ -567,7 +567,7 @@ NVN(nvnProgramInitialize, NVNboolean, NVNprogram *p, NVNdevice *d) {
 static void pk_drop(const void *p);
 NVN(nvnProgramFinalize, void, NVNprogram *p) { mtl_prog_release((prog_t *)p); ((prog_t *)p)->magic = 0; pk_drop(p); }
 // a program's per-stage keys (side table: guest NVNprogram address → host object; bit i of ok = stage i computed)
-typedef struct { uint8_t key[6][8]; uint8_t ok; } prog_keys_t;
+typedef struct { uint8_t key[6][8], c700[6][8]; uint8_t ok, c700_ok; } prog_keys_t;   // c700: control +0x700..+0x707 of each stage, for its code key (prog_code_key)
 static pthread_mutex_t g_pk_mu = PTHREAD_MUTEX_INITIALIZER; static CFMutableDictionaryRef g_pk;   // a dedicated table (keys not shared with other side tables)
 static prog_keys_t *pk_get(const void *p, int make) {
     pthread_mutex_lock(&g_pk_mu);
@@ -599,6 +599,23 @@ static int keys_hash(const NVNshaderData *sd, int mapped, uint8_t out[8]) {
     CC_SHA256_Final(md, &hc); memcpy(out, md, 8);
     return 1;
 }
+// The code key (prog_code_key): sha256 of control +0x700..+0x707 (where the c1 constant segment starts in the code area, and the code area's length) and the code area. A graphics shader's translation
+// depends on these alone (dmsh_build.py job_for: the code area, c1 taken from it at that offset); the rest of the control section only goes into the map key. Xenoblade Chronicles 3 builds
+// programs at run time from code areas of its SPCH packs with other control sections (one vertex shader's code shared by several programs, a debug hash at control +0x7d0 rewritten), so their
+// map keys are in no table while their code is: the replay then takes the library of a shader with the same code (nvn_mtl.m prog_get, code_index.tsv).
+// The control bytes are kept at SetShaders (the control section may be gone later) and the code area is read when the key is asked for (it may be filled after SetShaders)
+int nvn_host_readable(uint64_t a, uint64_t n);
+int prog_code_key(const prog_t *p, unsigned st, uint8_t key[8]) {
+    prog_keys_t *k = st < p->nstage ? pk_get(p, 0) : NULL;
+    if (!k || !(k->c700_ok >> st & 1)) return 0;
+    uint32_t ncode; memcpy(&ncode, k->c700[st] + 4, 4);
+    uint64_t data = p->sd[st].data;
+    if (!data || !ncode || ncode >= (1u << 24) || !nvn_host_readable(data, ncode)) return 0;
+    uint8_t md[CC_SHA256_DIGEST_LENGTH]; CC_SHA256_CTX hc; CC_SHA256_Init(&hc);
+    CC_SHA256_Update(&hc, k->c700[st], 8); CC_SHA256_Update(&hc, (const void *)(uintptr_t)data, ncode);
+    CC_SHA256_Final(md, &hc); memcpy(key, md, 8);
+    return 1;
+}
 int prog_key(const prog_t *p, unsigned st, uint8_t key[8]) {
     if (st >= p->nstage) return 0;
     prog_keys_t *k = pk_get(p, 1);
@@ -613,9 +630,10 @@ NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData 
     // The keys are computed here (see prog_key in nvn_obj.h): the control section is only guaranteed valid during this call; the code area lives in a memory pool and stays valid while the program is in use
     static int dump = -1; if (dump < 0) dump = getenv("DM_NVN_SHDUMP") != NULL;
     prog_keys_t *k = pk_get(p, 1);
-    k->ok = 0;
+    k->ok = k->c700_ok = 0;
     for (int i = 0; i < n; i++) {
         if (keys_hash(&sd[i], 1, k->key[i])) k->ok |= (uint8_t)(1u << i);
+        if (sd[i].control) { memcpy(k->c700[i], (const uint8_t *)sd[i].control + 0x700, 8); k->c700_ok |= (uint8_t)(1u << i); }   // for the code key (prog_code_key)
         // DM_NVN_SHDUMP (debugging): keep a copy of the control section so the replay layer can save shaders missing from the map (never freed)
         if (dump && sd[i].control) { void *c = malloc(0x880); memcpy(c, sd[i].control, 0x880); o->sd[i].control = c; }
     }

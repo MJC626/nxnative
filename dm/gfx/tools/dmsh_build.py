@@ -972,6 +972,19 @@ json.dump([{'key': r[0], 'st': r[1], 'err': r[2]} for r in res], open(os.path.jo
 if not want:   # a full build: the stamp, then the c1 guard and uniform read extent tables from these Mac outputs, into the profile folder (the host takes them only beside this stamp)
     for _d in [out] + ([IOSOUT] if IOSOUT else []): dmsh_chain.write_stamp(_d, GAME.id, INPUTS)
     print(f'library stamp: game {GAME.id}, inputs {INPUTS}', flush=True)
+    # The code index (code_index.tsv beside the libraries): code key → the map key of a built graphics shader with that code. The code key is sha256 of control +0x700..+0x707 and the code
+    # area, all a graphics shader's translation depends on (job_for); the host takes it for a shader whose map key is missing (hle_nvn.c prog_code_key, nvn_mtl.m prog_get). Xenoblade
+    # Chronicles 3 makes programs at run time from its SPCH packs' code areas with other control sections, which no table can list ahead
+    _ci = {}
+    for _k in sorted(recs):
+        _rec = recs[_k][1]; _c = _rec.find(bytes.fromhex('34127698'))
+        if _c < 0 or recs[_k][0][:2] not in ('vs', 'ps', 'gs') or not os.path.exists(os.path.join(out, _k + '_b.json')): continue
+        _ci.setdefault(hashlib.sha256(_rec[_c + 0x700:_c + 0x708] + _rec[0x38:_c]).hexdigest()[:16], _k)
+    for _d in [out] + ([IOSOUT] if IOSOUT else []):
+        with open(os.path.join(_d, 'code_index.tsv'), 'w') as _f:
+            _f.write('# code key (sha256 of control +0x700..+0x707 and the code area) <TAB> map key of a built shader with that code (dmsh_build.py; nvn_mtl.m prog_get)\n')
+            for _a in sorted(_ci): _f.write(f'{_a}\t{_ci[_a]}\n')
+    print(f'code index: {len(_ci)} code keys', flush=True)
     for _tool, _table in (('c1_guard.py', 'c1_full.tsv'), ('cb_extent.py', 'cb_extent.tsv')):
         _r = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), _tool), out, str(GAME.table(_table))], capture_output=True, text=True)
         if _r.returncode: sys.exit(f'[RED] {_tool} failed ({_r.returncode}): {_r.stderr.strip()[-500:]}')
