@@ -1,0 +1,24 @@
+# Hand-written translation facts, merged over the generated rows of shader_facts.tsv by dm/gfx/tools/shader_split.py: key <TAB> facts JSON (same format)
+# The translator declares every fragment output float; Metal refuses a pipeline whose float output meets an integer attachment (the host's red line prints the row to add here).
+# The rows below are the ones the host printed: the title screen (R8Uint target 2, R32Uint target 3), the first field (RG32Uint targets 0-1, R32Uint target 3), then the first battle
+# (R32Uint target 3, lighting variants of shd_lgt.wishp; their MSL writes the target as a float bit cast, which 4,353 float outputs do too, so no rule can pick them out)
+06f1dcc9c37acf00	{"fout":{"0":"uint","1":"uint"}}
+0ef0655d693d391c	{"fout":{"3":"uint"}}
+12053fbfa187d65c	{"fout":{"3":"uint"}}
+13c0ec751ce9b205	{"fout":{"3":"uint"}}
+15816d836842bfb5	{"fout":{"0":"uint","1":"uint"}}
+22f59502ead51fd4	{"fout":{"3":"uint"}}
+246cfb4f9fc7908b	{"fout":{"3":"uint"}}
+4b9a4e60d5ee5f16	{"fout":{"0":"uint","1":"uint"}}
+4bae5b8abd3bec7f	{"fout":{"0":"uint","1":"uint"}}
+531d637463e53486	{"fout":{"2":"uint"}}
+885bb4caecc378cf	{"fout":{"0":"uint","1":"uint"}}
+98c83c0c1ddb9841	{"fout":{"3":"uint"}}
+aadd1c2efa076cc3	{"fout":{"0":"uint","1":"uint"}}
+b263dddd4b8aa086	{"fout":{"3":"uint"}}
+c043fd1ea888de3f	{"fout":{"3":"uint"}}
+c9d762917edfee9f	{"fout":{"0":"uint","1":"uint"}}
+d3c541d46f389225	{"fout":{"3":"uint"}}
+db30b7145b01decb	{"fout":{"3":"uint"}}
+dca3a0b6d04107b1	{"fout":{"3":"uint"}}
+e68af1bbbcc69de9	{"fout":{"3":"uint"}}

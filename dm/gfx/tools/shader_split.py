@@ -19,6 +19,8 @@
 #   · G2S (Koei Tecmo's KTGL, Hyrule Warriors: Age of Calamity): GLSLC compiler outputs inside the IDRK entries of the RDB data files (zlib in chunks), see idrk_shaders;
 #       ROMANCE OF THE THREE KINGDOMS 8 REMAKE's newer RDB keeps them in .fdata files (a PDRK header, then IDRK entries of zlib or LZ4 chunks)
 #   · SPKG (the older KTGL of Fire Emblem: Three Houses): shader packages of G2S containers, loose and inside the LINKDATA archive DATA0.bin / DATA1.bin, see kt_shaders and linkdata_jobs
+#   · SPCH / NVSD (Monolith Soft, Xenoblade Chronicles 3): shader packs in the entries of bf3.ard (indexed by bf3.arh), NVSD containers in main, see arh_jobs and nvsd_shaders; shaders the host saved on the
+#     device because no game file held them (DM_NVN_SHDUMP) are read from <version dir>/shader_dump, see dump_shaders
 #   · SDF (Capcom's RE Engine, Monster Hunter Rise): shader definitions inside the PAK archives (KPKA, entries zstd / deflate compressed), only the newest copy of each path, see kpka_jobs and sdf_shaders
 #   · Trinity packs (Game Freak, Pokémon Legends: Z-A): BNSH inside the files of arc/data.trpfs (Oodle Mermaid, decoded by the game's own decoder in the Mac host), see trpfs_jobs and trinity_shaders
 #   · SPK (Capcom's MT Framework, The Great Ace Attorney Chronicles): the shader package inside an ARC archive (zlib entries), code area + control section per shader, see mtarc_members and mtspk_shaders
@@ -343,6 +345,144 @@ def kpka_jobs(files, parts=64):
         if size >= step: jobs += [(p_, r_, tuple(es)) for (p_, r_), es in cur.items()]; cur, size = collections.defaultdict(list), 0
     jobs += [(p_, r_, tuple(es)) for (p_, r_), es in cur.items()]
     return jobs, {p for p, _ in paks}
+
+def nvsd_shaders(d, label):
+    """Monolith Soft NVSD containers (Xenoblade Chronicles 3: embedded in main).
+    A sequence of NVSD headers (magic 'NVSD', version 0x2711), each defining a vertex/pixel pair,
+    followed by the control sections and code areas.
+    """
+    out, nvsd_pos, p = [], [], 0
+    while True:
+        p = d.find(b'NVSD', p)
+        if p < 0: break
+        if len(d) - p >= 8 and struct.unpack_from('<I', d, p + 4)[0] == 0x2711:
+            nvsd_pos.append(p)
+        p += 4
+    if not nvsd_pos: return out
+    c_pos = d.find(CTL_MAGIC, nvsd_pos[-1])
+    g_pos = d.find(GFX_MAGIC, c_pos)
+    if c_pos < 0 or g_pos < 0: return out
+    cur_c, cur_g = c_pos, g_pos
+    for i, pos in enumerate(nvsd_pos):
+        v_code_len = struct.unpack_from('<I', d, pos + 0x10)[0]
+        v_ctl_len  = struct.unpack_from('<I', d, pos + 0x18)[0]
+        p_code_len = struct.unpack_from('<I', d, pos + 0x24)[0]
+        p_ctl_len  = struct.unpack_from('<I', d, pos + 0x2c)[0]
+        v_ctl, v_code = d[cur_c : cur_c + v_ctl_len], d[cur_g : cur_g + v_code_len]
+        why_v = check(label, 'vs', v_ctl, v_code)
+        if why_v: red(f'{label} NVSD {i} vs: {why_v}')
+        out.append((f'{label}#NVSD#var{i}', 'vs', v_ctl, v_code))
+        cur_c = (cur_c + v_ctl_len + 7) & ~7
+        cur_g += v_code_len
+        p_ctl, p_code = d[cur_c : cur_c + p_ctl_len], d[cur_g : cur_g + p_code_len]
+        why_p = check(label, 'ps', p_ctl, p_code)
+        if why_p: red(f'{label} NVSD {i} ps: {why_p}')
+        out.append((f'{label}#NVSD#var{i}', 'ps', p_ctl, p_code))
+        cur_c = (cur_c + p_ctl_len + 7) & ~7
+        cur_g += p_code_len
+    return out
+
+XBC1, ARH = b'xbc1', b'arh1'
+def xbc1_blocks(raw):
+    """Every xbc1 block in raw → (name, decompressed bytes); header: magic, type (1 = zlib, else zstd), uncompressed size, compressed size, hash, 28-byte name"""
+    import zlib
+    i = 0
+    while (i := raw.find(XBC1, i)) >= 0:
+        typ, _, csz = struct.unpack_from('<III', raw, i + 4)
+        name = raw[i + 20:i + 48].split(b'\0')[0].decode('ascii', errors='replace')
+        body = raw[i + 48:i + 48 + csz]; i += 48 + csz
+        try: yield name, zlib.decompress(body) if typ == 1 else zstd_mod().decompress(body)
+        except Exception: pass   # a magic inside other data, not a block
+
+def arh_entries(arh_path):
+    """Monolith Soft's archive index bf3.arh → [(offset low, offset high, compressed size, size, flags, id)] (a stored entry has size 0 and its length in the compressed-size field), or None"""
+    with open(arh_path, 'rb') as f:
+        hdr = f.read(48)
+        if len(hdr) < 48: return None
+        words = struct.unpack('<12I', hdr)
+        f.seek(words[7]); t = f.read(24 * words[8])
+    return [struct.unpack_from('<6I', t, 24 * i) for i in range(len(t) // 24)]
+
+def arh_jobs(files, parts=64):
+    """Xenoblade Chronicles 3 keeps its files in one archive, bf3.ard, indexed by bf3.arh (paths only as hashes). Shaders are SPCH packs (magic HCPS) in the global /monolib/shader/*.wishp, in every
+    map's .wismda (its terrain and props) and in the models' stored .wismt streams (characters: xbc1 blocks at inner offsets of a stored entry), and GLSLC outputs in /effect/cmn_assets.wipac (effects).
+    Every entry is read. → ([(ard path, rel, ('ARH', entries)), …] in about equal stored sizes, the archive paths taken)"""
+    out, taken = [], set()
+    for p, r in files:
+        if not p.endswith('.arh') or not os.path.exists(p[:-1] + 'd'): continue
+        ents = arh_entries(p)
+        if not ents: continue
+        taken |= {p, p[:-1] + 'd'}
+        step, cur, size = sum(e[2] for e in ents) / parts, [], 0
+        for i, e in enumerate(ents):
+            cur.append((i,) + e); size += e[2]
+            if size >= step: out.append((p[:-1] + 'd', r[:-1] + 'd', ('ARH', tuple(cur)))); cur, size = [], 0
+        if cur: out.append((p[:-1] + 'd', r[:-1] + 'd', ('ARH', tuple(cur))))
+    return out, taken
+
+def ard_blobs(f, e):
+    """One archive entry (index, offset low, offset high, compressed size, size, flags, id) → [(tag, name, data)]: a compressed entry's xbc1 blocks (tag = block number), a stored entry's own
+    bytes (tag 'raw') and its xbc1 blocks at inner offsets, plus one level of blocks nested in those"""
+    f.seek(e[1] | (e[2] << 32)); raw = f.read(e[3] + 48)   # a compressed entry's size does not count its 48-byte xbc1 header
+    if not e[4]: raw = raw[:e[3]]
+    out = [(str(bi), name, d) for bi, (name, d) in enumerate(xbc1_blocks(raw))] if raw[:4] == XBC1 else [('raw', '', raw)] + [(f'raw.{bi}', name, d) for bi, (name, d) in enumerate(xbc1_blocks(raw))]
+    out += [(f'{t}.{bj}', n2, d2) for t, _, d in list(out) if t != 'raw' and XBC1 in d for bj, (n2, d2) in enumerate(xbc1_blocks(d))]
+    return out
+
+def arh_shaders(path, rel, ents, out):
+    """The SPCH packs and GLSLC outputs of a range of bf3.ard entries (arh_jobs). A pack whose shader fails the check is skipped (counted, one red line)"""
+    skipped = [0]
+    def skip(msg): skipped[0] += 1
+    with open(path, 'rb') as f:
+        for e in ents:
+            for t, name, d in ard_blobs(f, e):
+                j = 0
+                while (j := d.find(b'HCPS', j)) >= 0:
+                    spch_pack(d[j:], f'/{rel[:-1]}h#' + (name if (t, j) == ('0', 0) else f'{e[0]}.{t}@{j:x}:{name}'), out, skip); j += 4
+                # /effect/cmn_assets.wipac holds SPCH packs and 1,362 GLSLC outputs beside them (824 shaders no pack has)
+                if b'\x91\x68\x86\x19' in d: out += glslc_shaders(d, f'/{rel[:-1]}h#{e[0]}.{t}:{name}', need=False)
+    if skipped[0]: print(f'[RED] /{rel}: {skipped[0]} SPCH shaders in entries {ents[0][0]}..{ents[-1][0]} failed the check and were left out', flush=True)
+
+def spch_pack(d, label, out, red=red):
+    """One SPCH pack: header words 8 (code area), 10 / 11 (control sections, 0x880 bytes each; +0x704 = code length); stages from the code header (compute: magic 0x12345679)."""
+    if len(d) < 64: return
+    words = struct.unpack('<16I', d[:64])
+    ctl_base, ctl_size, cur_code = words[10], words[11], words[8]
+    if not ctl_size or ctl_base + ctl_size > len(d) or cur_code > len(d): return
+    for i in range(ctl_size // 0x880):
+        c_off = ctl_base + i * 0x880
+        code_len = struct.unpack_from('<I', d, c_off + 0x704)[0]
+        ctl = d[c_off:c_off + 0x880]
+        code = d[cur_code:cur_code + code_len]
+        if len(code) < 0x34: red(f'{label} shader {i}: code area past the pack'); return
+        code_magic = struct.unpack_from('<I', d, cur_code)[0]
+        if code_magic == 0x12345679:
+            st = 'cs'
+        else:
+            sph0 = struct.unpack_from('<I', d, cur_code + 0x30)[0]
+            st = SPH_STAGE.get((sph0 >> 10) & 0xf, 'vs')
+        why = check(label, st, ctl, code)
+        if why:
+            red(f'{label} shader {i} {st}: {why}')
+        else:
+            out.append((f'{label}#var{i // 2}', st, ctl, code))
+        cur_code += code_len
+
+def dump_shaders(d, label):
+    """Shaders the host saved on the device because they were missing from the map (DM_NVN_SHDUMP, nvn_mtl.m): <key>.ctl (the 0x880-byte control section) + <key>.code (the code area).
+    Xenoblade Chronicles 3 patches some GLSLC outputs of /effect/cmn_assets.wipac at load time (control and code both differ) and builds others that no container holds, so no scan of the game data
+    finds them; the dump holds exactly what the GPU gets. The file name must be the key"""
+    out = []
+    for nm in sorted(f for f in os.listdir(d) if f.endswith('.ctl')) if os.path.isdir(d) else []:
+        k = nm[:-4]
+        if not os.path.exists(os.path.join(d, k + '.code')): red(f'{label}/{nm}: no {k}.code beside it')
+        ctl, code = open(os.path.join(d, nm), 'rb').read(), open(os.path.join(d, k + '.code'), 'rb').read()
+        st = 'cs' if code[:4] == CS_MAGIC else SPH_STAGE.get((struct.unpack_from('<I', code, 0x30)[0] >> 10) & 0xf) if code[:4] == GFX_MAGIC and len(code) >= 0x34 else None
+        why = 'no stage in the code header' if not st else check(label, st, ctl, code)
+        if why: red(f'{label}/{k}: {why}')
+        if skey(ctl, code) != k: red(f'{label}/{k}: the file name is not the key of its contents ({skey(ctl, code)})')
+        out.append((f'{label}/{k}', st, ctl, code))
+    return out
 
 def sdf_shaders(d, label):
     """RE Engine shader definition ('SDF\\0', 2,685 entries in Monster Hunter Rise's PAKs): u16 version 1, u16 entry count, u64, then 0x108-byte entries from +0x10. Entry +0x10: six u64 offsets
@@ -1544,6 +1684,9 @@ def scan_file(args):
     if len(args) > 2 and head[:4] == CPK:   # entries of a CRI CPK (cpk_jobs)
         cpk_shaders(path, rel, args[2], found)
         return rel, uniq_keys(found), var_pairs(found), trees
+    if len(args) > 2 and args[2][0] == 'ARH':   # entries of Xenoblade Chronicles 3's bf3.ard (arh_jobs)
+        arh_shaders(path, rel, args[2][1], found)
+        return rel, uniq_keys(found), var_pairs(found), trees
     if len(args) > 2 and head[:4] == KPKA:   # entries of an RE Engine PAK (kpka_jobs)
         kpka_shaders(path, rel, args[2], found)
         return rel, uniq_keys(found), var_pairs(found), trees
@@ -1614,7 +1757,7 @@ def main():
     # The first version's source column is unchanged; later versions are prefixed with their workspace directory name (e.g. v327680): /v327680/Shader/…, main@v327680. They sort after the first version, so existing rows keep their package indices.
     romfs_v, main_v = romfs_l.split(','), main_l.split(',')
     if len(romfs_v) != len(main_v): red(f'{len(romfs_v)} RomFS and {len(main_v)} main: they must pair one to one')
-    files, results, common = [], [], None
+    files, results, common, dumps = [], [], None, []
     for i, (romfs, mainnso) in enumerate(zip(romfs_v, main_v)):
         tag = os.path.basename(os.path.dirname(os.path.abspath(romfs))) if i else ''
         files += sorted((os.path.join(dp, f), (tag + '/' if tag else '') + os.path.relpath(os.path.join(dp, f), romfs)) for dp, _, fs in os.walk(romfs) for f in fs)
@@ -1626,6 +1769,7 @@ def main():
         found = []; scan_blob(img, 'main' + ('@' + tag if tag else ''), found)
         found += glslc_shaders(img, 'main' + ('@' + tag if tag else ''), need=False)
         found += tfxo_streams(img, 'main' + ('@' + tag if tag else ''))   # YEBIS's effect file, a zlib stream in main (Pokémon Sword)
+        if b'NVSD' in img: found += nvsd_shaders(img, 'main' + ('@' + tag if tag else ''))   # Monolith Soft's NVSD containers (Xenoblade Chronicles 3's main)
         found += raw_shaders(img, 'main' + ('@' + tag if tag else ''), {c for _, _, c, _ in found})
         # GLSLC outputs the game compiles at run time, captured on the Mac (hle_glslc.c): <version dir>/glslc_capture, or DM_GLSLC_CAPTURE. A game needs them when main holds GLSL sources and
         # calls glslcCompile in a module it loads (Fire Emblem: Three Houses; profile_guess.py shader_sources). Captain Toad: Treasure Tracker imports it with agl's GLSL sources, but no module defines it
@@ -1640,6 +1784,10 @@ def main():
         if not names and uepak.unreal_paks(romfs, legacy=False): red(f'the RomFS has Unreal paks, but there are no decoded shader code archives in {ued} (the NSP script writes them)')
         for nm in names: found += ue_shaders(open(os.path.join(ued, nm), 'rb').read(), f'/ue_shaders/{nm}')
         results.append(('main', {skey(c, k): (w, s, c, k) for w, s, c, k in found}, var_pairs(found), {}))
+        # Shaders the host saved on the device because no game file held them (DM_NVN_SHDUMP): <version dir>/shader_dump, or DM_SHADER_DUMP. Taken after every file (dump_results below), so a key
+        # the game files hold keeps its source there
+        dd = os.environ.get('DM_SHADER_DUMP') or os.path.join(os.path.dirname(os.path.abspath(romfs)), 'shader_dump')
+        if os.path.isdir(dd): dumps.append(uniq_keys(dump_shaders(dd, ('/' + tag if tag else '') + '/shader_dump')))
     zdicts = {k: v for r in romfs_v for k, v in zs_dicts(r).items()}   # Tears of the Kingdom's zstd dictionaries (zs_dicts)
     keys = {}
     # First pass: every file; Unity bundles carry type trees, and the Shader trees are collected on the way. Second pass: Unity serialized files without type trees are scanned again with the borrowed trees
@@ -1652,8 +1800,9 @@ def main():
     arc_jobs, arcs = smash_arc_jobs(files)   # Super Smash Bros. Ultimate's data.arc: its current files, in ranges
     pz_jobs, pkzs = pkz_jobs(files)   # Bayonetta 3's PKZ archives, Oodle Kraken decoded by the game's own decoder in the Mac host
     ck_jobs, cpks = cpk_jobs(files)   # Bayonetta 2's CRI CPK archives (CRILAYLA entries)
-    big += pak_jobs + tr_jobs + ue_jobs + bd_jobs + arc_jobs + pz_jobs + ck_jobs
-    files = [(p, r) for p, r in files if not linkdata_jobs(p, r) and p not in paks and p not in trp and p not in uep and p not in bdts and p not in arcs and p not in pkzs and p not in cpks]
+    ar_jobs, arhs = arh_jobs(files)   # Xenoblade Chronicles 3's bf3.arh / bf3.ard: every entry, in ranges
+    big += pak_jobs + tr_jobs + ue_jobs + bd_jobs + arc_jobs + pz_jobs + ck_jobs + ar_jobs
+    files = [(p, r) for p, r in files if not linkdata_jobs(p, r) and p not in paks and p not in trp and p not in uep and p not in bdts and p not in arcs and p not in pkzs and p not in cpks and p not in arhs]
     with cf.ProcessPoolExecutor(J, initializer=_pool_init, initargs=(common, {}, zdicts)) as ex:
         results += list(ex.map(scan_file, big)) + list(ex.map(scan_file, files, chunksize=16))
     trees, defer = {}, []
@@ -1670,6 +1819,7 @@ def main():
             if extra == 'defer': red(f'{rel}: Unity serialized file without type trees, and no bundle has a Shader type tree of the same hash to borrow')
         results = [r for r in results if r[3] != 'defer'] + again
     per_src = collections.Counter(); pairs = set()
+    results += [('dump', u, set(), {}) for u in dumps]   # last (see shader_dump above)
     for rel, uniq, pr, _ in results:
         pairs |= pr
         for key, v in uniq.items():
@@ -1701,7 +1851,8 @@ def main():
                                             ('MSHD', any('#MSHD#' in r[4] for r in rows)), ('GLSLC', any('#GLSLC@' in r[4] for r in rows)), ('RE Engine SDF', any('#SDF#' in r[4] for r in rows)),
                                             ('MT Framework SPK', any('#MTSPK@' in r[4] for r in rows)), ('MonoGame MGFX', any('#MGFX@' in r[4] for r in rows)),
                                             ('PlatinumGames shader objects', any('#PGSO' in r[4] for r in rows)),
-                                            ('Unreal Engine shader code archives', any('#UE' in r[4] for r in rows))) if hit)
+                                            ('Unreal Engine shader code archives', any('#UE' in r[4] for r in rows)),
+                                            ('Monolith Soft SPCH / NVSD', any('.wishp' in r[4] or '#NVSD#' in r[4] for r in rows)), ('device dump', any('/shader_dump/' in r[4] for r in rows))) if hit)
         f.write(f'# kind: evidence  {NOTE} ({kinds} in RomFS + main) → control section + code area keys (dm/gfx/tools/shader_split.py)\n')
         f.write('# column 5 records where each key first appears; this game has no PC version to pair with\n')
         f.write('package\tindex\tstage\tdm_ctl_sha16\tsource\n')

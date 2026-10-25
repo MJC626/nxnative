@@ -1257,6 +1257,12 @@ def data_rows(b):   # a table's data rows (without # comment lines: the header c
     return [l for l in b.splitlines() if not l.startswith(b'#')]
 
 
+def dump_wanted(g):   # the device-dumped shaders the profile's shader map was built from (column 5: /shader_dump/<key>)
+    try: t = g.table('shader_map.tsv').read_text(errors='replace')
+    except OSError: return set()
+    return set(re.findall(r'\t/shader_dump/([0-9a-f]{16})$', t, re.M))
+
+
 def split_shaders(py, repo, roms, mains, pkg, env, logs, g, provisional=False, oodle=None):
     """The shader split into pkg, checked against the profile's tables. The package is reused when the tools, the profile and each version's main, RomFS (paths and sizes) and run-time capture
     are as at the last successful split. Returns the package's content key, the iOS shaders' input (None for a provisional profile or damaged files, which never reuse them): a split that runs
@@ -1267,7 +1273,13 @@ def split_shaders(py, repo, roms, mains, pkg, env, logs, g, provisional=False, o
     kf = pkg.with_name(pkg.name + '.key')
     key = None if provisional or ALLOW_DAMAGED else fingerprint(('files', tool_files(repo)), ('files', profile_files(g)),
         *[x for r, m in zip(roms, mains) for x in (('files', [m]), ('tree', r), ('files', sorted((r.parent / 'glslc_capture').glob('*.glslc'))),
-                                                   ('files', sorted((r.parent / 'ue_shaders').glob('*.ushaderbytecode'))))])
+                                                   ('files', sorted((r.parent / 'ue_shaders').glob('*.ushaderbytecode'))),
+                                                   ('files', sorted((r.parent / 'shader_dump').glob('*.c*'))))])
+    if not provisional and (want := dump_wanted(g)):
+        # shaders the host saved on the device (DM_NVN_SHDUMP, Xenoblade Chronicles 3): only the device can give them, so a missing one stops here with what to copy, not later as a table difference
+        lack = sorted(k for k in want if not all((roms[0].parent / 'shader_dump' / f'{k}{x}').is_file() for x in ('.ctl', '.code')))
+        if lack: raise BuildError(f'{len(lack)} of the {len(want)} device-dumped shaders the profile\'s shader map names are missing from {roms[0].parent / "shader_dump"} '
+                                  f'(first {lack[0]}): copy the phone\'s Documents/shdump/*.ctl and *.code there')
     if key and pkg.is_dir() and (note := reused(kf, key)) is not None:
         PROG.end(f'{note}, reused (inputs unchanged)'); return package_key(pkg)
     if oodle:   # the packs are decoded by the game's own Oodle in the Mac host (dm/host/hle_oodle.c)
@@ -1548,6 +1560,8 @@ def parse_args(argv):
     ap.add_argument('--allow-damaged', action='store_true', help='a damaged NSP (files failing the NCA hash check): write them as read and go on instead of stopping')
     ap.add_argument('--profile-out', help='where the provisional profile goes (default: <NSP folder>/<title ID>_build/profile)')
     ap.add_argument('--provisional', action='store_true', help='build from a provisional profile even when dm/games has one for the game (tests the guesses)')
+    ap.add_argument('--no-romfs', action='store_true', help='do not put the RomFS in the IPA: the game files go in the app\'s Documents/romfs through the Files app (main.m accepts them there), '
+                    'for a game too large to sideload in one IPA (Xenoblade Chronicles 3: 15 GB)')
     ap.add_argument('--no-heap-check', action='store_true', help='a provisional profile: skip the heap check on the Mac (the alias / heap split stays a guess)')
     ap.add_argument('--progress', choices=('auto', 'bar', 'lines', 'json', 'off'), help='stage lines on the console: bar = one line per stage, redrawn in place; lines = a plain line every BEAT seconds; json = newline-delimited JSON events (no prompts); off = only each stage\'s start and end '
                     '(default: the PROGRESS setting; auto = bar in a terminal or Spyder, lines when the output goes to a file or a pipe)')
@@ -1762,7 +1776,12 @@ def main(args=None):
 
     if not prepare_xcode and free_gb(out_ipa.parent) < 5: raise BuildError(f'less than 5 GB free on the volume of {out_ipa.parent}')
     say('preparing the Xcode project' if prepare_xcode else f'building the IPA → {out_ipa}')
-    ipa_env = dict(env, GAME=g.id, W=str(work / 'ipa'), PATCHED=str(patched), ROMFS=str(game / 'RomFS'), MSL_IOS=str(ios), GFXAPI=gfx, FONT_PY=py, DM_DISPLAY_NAME=app_name, DM_BUNDLE_ID=bundle_id, AOC=str(aoc or ''), DM_XCODE_DERIVED_DATA=str(work / 'xcode-derived-data'), DM_TEAM_ID=team_id, DM_LANG=lang)
+    romfs_ipa = game / 'RomFS'
+    if args.no_romfs:   # an IPA without the game files: a RomFS of only the profile's marker file, so the app's own copy never counts (main.m looks for Documents/romfs first)
+        romfs_ipa = work / 'dummy_romfs'; rmtree(romfs_ipa)
+        (romfs_ipa / g.get('romfs_marker')).parent.mkdir(parents=True, exist_ok=True); (romfs_ipa / g.get('romfs_marker')).touch()
+        say('the IPA holds no game files: copy the RomFS into the app\'s Documents/romfs on the device')
+    ipa_env = dict(env, GAME=g.id, W=str(work / 'ipa'), PATCHED=str(patched), ROMFS=str(romfs_ipa), MSL_IOS=str(ios), GFXAPI=gfx, FONT_PY=py, DM_DISPLAY_NAME=app_name, DM_BUNDLE_ID=bundle_id, AOC=str(aoc or ''), DM_XCODE_DERIVED_DATA=str(work / 'xcode-derived-data'), DM_TEAM_ID=team_id, DM_LANG=lang)
     if prepare_xcode: ipa_env['DM_XCODE_PROJECT_DIR'] = str(project.parent)
     if app_version: ipa_env['DM_APP_VERSION'] = app_version
     # app icon: the game icon nx_extract saved from the control data (English, icon.jpg); the packed version's first, then the base game's
