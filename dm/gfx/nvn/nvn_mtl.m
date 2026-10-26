@@ -2115,7 +2115,23 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         return mt;
     }
     alias_key ak; memset(&ak, 0, sizeof ak); ak.pool = (uint64_t)(uintptr_t)t->pool; ak.off = t->off; ak.d = t->d;
-    pthread_mutex_lock(&g_smu); __unsafe_unretained id shared = hm_get_id(&g_alias, &ak); if (shared) nvn_hm_put(&g_alias_seen, &ak, (void *)(uintptr_t)(g_fence + 1)); pthread_mutex_unlock(&g_smu);
+    pthread_mutex_lock(&g_smu); __unsafe_unretained id shared = hm_get_id(&g_alias, &ak); if (shared) nvn_hm_put(&g_alias_seen, &ak, (void *)(uintptr_t)(g_fence + 1));
+    // The same storage seen through an object whose description differs only in what does not change the texels (flags, stride, packaged block height): one texture.
+    // Xenoblade Chronicles 3 renders each shadow map through one object (render-target flags) and samples it through another (serials 1903 → 1904, 6055 → 6056): kept apart, the
+    // sampled one never saw the rendering, and the shadows read stale storage (black blocks across the ground and walls)
+    if (!shared) for (uint32_t i = 0; i < g_alias.cap; i++) {
+        if (!g_alias.vals[i]) continue;
+        alias_key k; memcpy(&k, g_alias.keys + (size_t)i * g_alias.klen, sizeof k);
+        uint32_t pa = 0, pb = 0; uint8_t sw[4];
+        if (k.d.format != ak.d.format && !(nvn_fmt_to_mtl(k.d.format, &pa, sw) && nvn_fmt_to_mtl(ak.d.format, &pb, sw) && pa && pa == pb)) continue;   // or another NVN format Metal stores the same
+        if (k.pool != ak.pool || k.off != ak.off || k.d.target != ak.d.target || k.d.width != ak.d.width || k.d.height != ak.d.height ||
+            k.d.depth != ak.d.depth || k.d.levels != ak.d.levels || (k.d.samples > 1 ? k.d.samples : 1) != (ak.d.samples > 1 ? ak.d.samples : 1)) continue;
+        shared = (__bridge id)g_alias.vals[i]; nvn_hm_put(&g_alias_seen, &k, (void *)(uintptr_t)(g_fence + 1));
+        static int n; if (n++ < 8) MLOG("texture ser=%llu shares the storage of a texture described differently (format %#x / %#x, flags %#x / %#x, stride %u / %u, block height %d / %d): one texture, %ux%u",
+                                       (unsigned long long)t->serial, ak.d.format, k.d.format, ak.d.flags, k.d.flags, ak.d.stride, k.d.stride, ak.d.pkg_block_h, k.d.pkg_block_h, ak.d.width, ak.d.height);
+        break;
+    }
+    pthread_mutex_unlock(&g_smu);
     if (shared) { tex_put(t->serial, shared); return shared; }
     id<MTLTexture> mt = tex_linear(t);
     if (!mt) {
