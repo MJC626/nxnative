@@ -1207,7 +1207,8 @@ static int ub_skip(const char *key) {   // Whether this phase should drop draws 
     for (int i = 0; i < g_ub_nk[uc]; i++) { const char *k = g_ub_keys[uc][i]; if (k[0] == '@') continue; if (k[0] == '*' || !strncmp(key, k, strlen(k))) return 1; }
     return 0;
 }
-void mtl_set_frame(uint64_t f) { atomic_store(&g_cur_frame, f); if (g_ub_n) ub_frame(f); }
+static void passdump_every(uint64_t f);
+void mtl_set_frame(uint64_t f) { atomic_store(&g_cur_frame, f); if (g_ub_n) ub_frame(f); passdump_every(f); }
 // GPU timing registration: gpu_tag_begin(frame) before commit, gpu_tag_done(frame, GPU start, GPU end) on completion (seconds on the CACurrentMediaTime base).
 // Old-queue command buffers go through gpu_tag_f; the Metal 4 main submission backfills in the feedback of mtl_sub_commit (when switching to Metal 4 all the call sites were lost and the GPU column of the timing line became empty)
 static void gpu_tag_begin(uint64_t f) {
@@ -2129,10 +2130,24 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         if (k.pool != ak.pool || k.off != ak.off || k.d.target != ak.d.target || k.d.width != ak.d.width || k.d.height != ak.d.height ||
             k.d.depth != ak.d.depth || k.d.levels != ak.d.levels || (k.d.samples > 1 ? k.d.samples : 1) != (ak.d.samples > 1 ? ak.d.samples : 1)) continue;
         shared = (__bridge id)g_alias.vals[i]; nvn_hm_put(&g_alias_seen, &k, (void *)(uintptr_t)(g_fence + 1));
-        static int n; if (n++ < 8) MLOG("texture ser=%llu shares the storage of a texture described differently (format %#x / %#x, flags %#x / %#x, stride %u / %u, block height %d / %d): one texture, %ux%u",
+        static int n; if (n++ < 40) MLOG("texture ser=%llu shares the storage of a texture described differently (format %#x / %#x, flags %#x / %#x, stride %u / %u, block height %d / %d): one texture, %ux%u",
                                        (unsigned long long)t->serial, ak.d.format, k.d.format, ak.d.flags, k.d.flags, ak.d.stride, k.d.stride, ak.d.pkg_block_h, k.d.pkg_block_h, ak.d.width, ak.d.height);
         break;
     }
+    // Storage that overlaps a texture of another format or size is not shared (Metal views need compatible formats): log it, as a texture drawn through one object and read through
+    // another sees nothing of the other's writes
+    if (!shared) { nvn_texlayout nl; nvn_tex_layout(&ak.d, &nl); static int nov;
+        for (uint32_t i = 0; nl.size && nov < 60 && i < g_alias.cap; i++) {
+            if (!g_alias.vals[i]) continue;
+            alias_key k; memcpy(&k, g_alias.keys + (size_t)i * g_alias.klen, sizeof k);
+            if (k.pool != ak.pool) continue;
+            nvn_texlayout kl; nvn_tex_layout(&k.d, &kl);
+            if (k.off >= ak.off + (int64_t)nl.size || ak.off >= k.off + (int64_t)kl.size) continue;
+            nov++; MLOG("texture ser=%llu (%ux%ux%u format %#x target %d levels %u flags %#x at pool offset %#llx, %llu bytes) overlaps a texture of %ux%ux%u format %#x target %d levels %u flags %#x at %#llx (%llu bytes): kept apart",
+                        (unsigned long long)t->serial, ak.d.width, ak.d.height, ak.d.depth, ak.d.format, ak.d.target, ak.d.levels, ak.d.flags, (unsigned long long)ak.off, (unsigned long long)nl.size,
+                        k.d.width, k.d.height, k.d.depth, k.d.format, k.d.target, k.d.levels, k.d.flags, (unsigned long long)k.off, (unsigned long long)kl.size);
+            break;
+        } }
     pthread_mutex_unlock(&g_smu);
     if (shared) { tex_put(t->serial, shared); return shared; }
     id<MTLTexture> mt = tex_linear(t);
@@ -2288,6 +2303,11 @@ static inline int passdump(void) {
     if (__builtin_expect(g_pd_a0 == -1, 1)) return 0;   // off (the usual case): answered first, it is asked for every binding of every draw
     if (g_pd_a0 == -2) { const char *e = getenv("DM_NVN_PASSDUMP"); g_pd_a1 = e && strchr(e, '-') ? atol(strchr(e, '-') + 1) : e ? atol(e) : -1; g_pd_a0 = e ? atol(e) : -1; }
     long f = (long)atomic_load(&g_cur_frame), a0 = g_pd_a0; return a0 >= 0 && f >= a0 && f <= g_pd_a1;
+}
+// Diagnostic DM_NVN_PASSDUMP_EVERY=n,k: the passes of k frames in a row every n frames (from frame n on), for faults that show only in motion, where a screenshot is hard to time
+static void passdump_every(uint64_t f) {
+    static long n = -1, k; if (n < 0) { const char *e = getenv("DM_NVN_PASSDUMP_EVERY"); n = 0; k = 2; if (e) { n = atol(e); const char *c = strchr(e, ','); if (c) k = atol(c + 1); if (k < 1) k = 1; if (n > 0) MLOG("DM_NVN_PASSDUMP_EVERY: the passes of %ld frames every %ld frames", k, n); } }
+    if (n > 0 && f && f % (uint64_t)n == 0) { g_pd_a0 = (long)f + 1; g_pd_a1 = (long)f + k; }
 }
 // The next n frames' passes, on request (the Mac's DM_CTL "passdump n", hle_hid.c): for a scene that a fixed DM_NVN_PASSDUMP frame range cannot be timed to
 void dm_gfx_passdump_next(long n) { long f = (long)atomic_load(&g_cur_frame); g_pd_a1 = f + n; g_pd_a0 = f + 1; }
