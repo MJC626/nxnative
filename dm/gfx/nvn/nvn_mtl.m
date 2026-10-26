@@ -539,6 +539,7 @@ typedef struct { __strong id<MTLBuffer> buf; uint64_t fence; } vis_buf;
 enum { VIS_RING = ALLOC_MAX };
 static vis_buf g_vis_ring[VIS_RING]; static int g_vis_ring_n, g_vis_ring_i = -1;
 static id<MTLBuffer> g_vis; static uint32_t g_vis_n;   // This submission's visibility buffer and number of slots used
+static int vis_accumulate(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_VIS_RESET"); v = !(e && !strcmp(e, "1")); if (!v) MLOG("DM_NVN_VIS_RESET=1: visibility results reset with each render encoder (Metal 4's default)"); } return v; }
 static int vis_in_ring(id<MTLBuffer> b) { for (int i = 0; i < g_vis_ring_n; i++) if (g_vis_ring[i].buf == b) return 1; return 0; }
 static int g_vis_on, g_vis_counting, g_vis_cur = -1; static uint64_t g_vis_cur_pass;
 static vis_slot *g_vs; static int g_nvs, g_vscap;      // Slots since the last reset
@@ -696,7 +697,7 @@ void mtl_sub_begin(void) {
     if (pick < 0) { uint64_t oldest = UINT64_MAX; for (int i = 0; i < VIS_RING; i++) if (g_vis_ring[i].fence < oldest) { oldest = g_vis_ring[i].fence; pick = i; } if (oldest > g_done) mtl_wait(oldest, UINT64_MAX); }
     g_vis_ring_i = pick; g_vis_ring[pick].fence = UINT64_MAX;
     if (!g_vis_ring[pick].buf) { g_vis_ring[pick].buf = [g_dev newBufferWithLength:VIS_SLOTS * 8 options:MTLResourceStorageModeShared]; res_add(g_vis_ring[pick].buf); }
-    g_vis = g_vis_ring[pick].buf;
+    g_vis = g_vis_ring[pick].buf; memset(g_vis.contents, 0, VIS_SLOTS * 8);   // the passes accumulate into their slots (vis_accumulate): start from 0; the GPU is done with this buffer
     void pg_sub_begin_ext(uint64_t fence); pg_sub_begin_ext(g_fence + 1);
     void arena_begin(void); arena_begin();
 }
@@ -2848,8 +2849,13 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
     }
     if (g_vis_on) {
         // Slots used up (one submission exceeds VIS_SLOTS counting passes): continue in a new overflow buffer. A ring buffer must not be retired (it is still used in rotation, and retiring removes it from the residency set); only a previous overflow buffer is
-        if (!g_vis || g_vis_n >= VIS_SLOTS) { if (g_vis && !vis_in_ring(g_vis)) defer_obj_release(g_vis); g_vis = [g_dev newBufferWithLength:VIS_SLOTS * 8 options:MTLResourceStorageModeShared]; res_add(g_vis); g_vis_n = 0; }
+        if (!g_vis || g_vis_n >= VIS_SLOTS) { if (g_vis && !vis_in_ring(g_vis)) defer_obj_release(g_vis); g_vis = [g_dev newBufferWithLength:VIS_SLOTS * 8 options:MTLResourceStorageModeShared]; res_add(g_vis); g_vis_n = 0;
+                                             memset(g_vis.contents, 0, VIS_SLOTS * 8); }
         pd.visibilityResultBuffer = g_vis;
+        // Metal 4's default visibility result type, Reset, resets the visibility data when a render encoder is created. Every counting pass has a slot of its own in one buffer, so the
+        // counts of the earlier passes of a submission came back 0: Xenoblade Chronicles 3's occlusion queries read 0 for visible draws (a 7,500-vertex G-buffer draw among them), and the
+        // game culled its characters. The passes accumulate instead, into slots zeroed when the submission takes the buffer. DM_NVN_VIS_RESET=1: Reset, as before
+        if (vis_accumulate()) pd.visibilityResultType = MTLVisibilityResultTypeAccumulate;
     }
     g_enc_vis = 0; g_enc_has_vis = g_vis_on;
     // Layered rendering: a vertex shader that writes the layer selects the attachment layer per primitive only when the pass has renderTargetArrayLength; without it every layer went to the

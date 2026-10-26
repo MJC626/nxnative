@@ -70,8 +70,11 @@ static void geo_draw(NvProg *pr, const p_draw *dw0, const p_draw_idx *di0) {
     // (the whole submission so far committed and finished) took 3-12 ms of the replay thread per draw. The other waits are taken once per submission and GPU write epoch
     // (g_wr_epoch, as mdi_wait's multi-draws), except for vertex data the CPU converts or the GPU wrote in this submission
     int tfg = ind && g_tf_gpu_draw, hard = 0;
-    int wait = (ind && !tfg) || di0 != NULL;  // CPU assembly must also see writes from earlier submissions.
-    for (int i = 0; i < 16 && !tfg; i++) if (S.vbuf[i].size && pend_hits(S.vbuf[i].address, S.vbuf[i].size)) wait = hard = 1;
+    // An indexed draw waits only when the GPU wrote its index range in this submission: a static or CPU-written index buffer (Xenoblade Chronicles 3's effects) needs none, and waiting
+    // for every write of the submission (uniform updates, copies) took up to 11 waits a frame
+    int wait = ind && !tfg;
+    if (di0 && !ind && di.itype >= 0 && di.itype <= 2 && di.count > 0 && pend_hits(di.ibuf, (uint64_t)di.count << di.itype)) wait = hard = 1;
+    // GPU-written vertex data needs no wait: the CPU reads only indices (vertex data only to convert it, below); every encoder begins with a full barrier
     for (int i = 0; i < vs->rf.nv; i++) if (vconv_wanted(&vs->rf, i, NULL, 0)) wait = hard = 1;
     g_geo_st[0]++; if (tfg) g_geo_st[3]++;
     if (defer_has_active()) defer_fallback();
