@@ -1685,6 +1685,10 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     uint64_t t0 = now_ns();
     if (idx >= 0 && idx < o->ntex && idx < 4) o->ticket[idx] = mtl_present(CTX(o->tex[idx]), present_period(o) / 1e9, o->crop);   // enqueue only, return immediately
     gfx_leave();
+    // Test switch DM_NVN_PRESENT_SYNC=1: the present returns once the GPU has finished everything submitted so far, so the game's next frame sees this frame's results in memory
+    // (occlusion queries a game reads without waiting: Xenoblade Chronicles 3 builds its exposure histogram from them). Costs the overlap of CPU and GPU
+    { static int ps_on = -1; if (ps_on < 0) { const char *e = getenv("DM_NVN_PRESENT_SYNC"); ps_on = e && !strcmp(e, "1"); if (ps_on) LOG("[nvn] DM_NVN_PRESENT_SYNC=1: each present waits for the GPU work submitted before it"); }
+      if (ps_on) { void mtl_wait_submitted(void); mtl_wait_submitted(); } }
     atomic_fetch_add(&g_nvn_ns, now_ns() - t0);
     uint64_t f = g_frame, ps, dr; mtl_stats(&ps, &dr);
     if (nvn_real[0] || nvn_real[1]) {   // DM_NVN_PROF: record phase = time of all implemented functions except submit; submit phase = QueueSubmitCommands

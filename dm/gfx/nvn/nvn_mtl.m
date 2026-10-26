@@ -1311,6 +1311,7 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
     return ok;
 }
 
+void mtl_wait_submitted(void) { if (g_fence) mtl_wait(g_fence, UINT64_MAX); }   // DM_NVN_PRESENT_SYNC (hle_nvn.c)
 static void mtl_finish_gpu(void) {
     if (g_fence) mtl_wait(g_fence, UINT64_MAX);
     if (on_sub_thread()) rec_publish();   // a batch's commit may still be a record in the encode thread's current block (rec_commit_upload), as in up_begin and q_cb
