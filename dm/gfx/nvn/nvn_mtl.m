@@ -4567,6 +4567,15 @@ static void warm_start(void) {
     atomic_store(&g_warm_running, 1);
     dispatch_async(q, ^{ warm_worker(paths); });
 }
+// DM_NVN_DEPTH_EQ=le: a draw that tests depth EQUAL without writing it (a G-buffer pass after a depth pre-pass) tests LESS_EQUAL with a small negative depth bias instead, so it
+// passes where its depth is within a few units of the pre-pass's. -fpreserve-invariance makes one expression agree across shaders, but a pre-pass and a G-buffer vertex shader the Metal
+// compiler optimizes differently can still differ in the last bits; Maxwell's multiply-adds always agree. Xenoblade Chronicles 3 (1,244 EQUAL draws a frame after an 800-draw pre-pass):
+// ground and walls in black blocks, flickering while the camera moves. DM_NVN_DEPTH_EQ=all also gives the bias to LESS_EQUAL draws (a G-buffer draw testing LESS_EQUAL after the
+// pre-pass fails the same way; drawn inside an occlusion query it counts 0 and the game culls the object: XC3's characters)
+enum { EQ_BIAS = 16 };
+static int depth_eq_le(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_DEPTH_EQ"); v = !e ? 0 : !strcmp(e, "all") ? 2 : !strcmp(e, "le");
+    if (v) MLOG("DM_NVN_DEPTH_EQ=%s: depth EQUAL without depth writes tests LESS_EQUAL%s, with a depth bias of -%d", e, v == 2 ? ", and LESS_EQUAL draws get the bias too" : "", EQ_BIAS); } return v; }
+static int depth_eq_bias(void) { return S.ds.dt && ((S.ds.df == NVN_DEPTH_FUNC_EQUAL && !S.ds.dw) || (S.ds.df == NVN_DEPTH_FUNC_LEQUAL && depth_eq_le() == 2)) && depth_eq_le(); }
 static id<MTLDepthStencilState> dss_get(int has_depth, int has_stencil) {
     struct { ds_st ds; uint32_t vm[2], wm[2]; int hd, hs; } k;
     memset(&k, 0, sizeof k); k.ds = S.ds; memcpy(k.vm, S.st_vmask, 8); memcpy(k.wm, S.st_wmask, 8); k.hd = has_depth; k.hs = has_stencil;
@@ -4574,7 +4583,8 @@ static id<MTLDepthStencilState> dss_get(int has_depth, int has_stencil) {
     id<MTLDepthStencilState> s = hm_get_id(&g_dss, &k);
     if (s) return s;
     MTLDepthStencilDescriptor *d = [MTLDepthStencilDescriptor new];
-    if (has_depth && S.ds.dt) { d.depthCompareFunction = (MTLCompareFunction)(S.ds.df - 1); d.depthWriteEnabled = S.ds.dw; }
+    if (has_depth && S.ds.dt) { d.depthCompareFunction = (MTLCompareFunction)(S.ds.df - 1); d.depthWriteEnabled = S.ds.dw;
+                                if (S.ds.df == NVN_DEPTH_FUNC_EQUAL && !S.ds.dw && depth_eq_le()) d.depthCompareFunction = MTLCompareFunctionLessEqual; }
     if (has_stencil && S.ds.st) {
         MTLStencilDescriptor *f = [MTLStencilDescriptor new], *b = [MTLStencilDescriptor new];
         f.stencilCompareFunction = (MTLCompareFunction)(S.ds.sf_f - 1); f.stencilFailureOperation = (MTLStencilOperation)(S.ds.fail_f - 1);
@@ -7204,6 +7214,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
       int wi = (S.poly.front == NVN_FRONT_FACE_CCW) != atomic_load_explicit(&g_origin_ll, memory_order_relaxed) ? MTLWindingCounterClockwise : MTLWindingClockwise;   // the y flip of lower-left mode reverses the winding
       int fi = S.poly.mode == NVN_POLYGON_MODE_LINE ? MTLTriangleFillModeLines : MTLTriangleFillModeFill, cl = !S.depth_clamp;   // depth clip off = SetDepthClamp
       float bi[3] = {0, 0, 0}; if (S.poly.offset_en & 4) { bi[0] = S.po.units; bi[1] = S.po.factor; bi[2] = S.po.clamp; }
+      else if (depth_eq_bias()) bi[0] = -(float)EQ_BIAS;   // see depth_eq_le
       if (!(g_ed.ok & ED_CULL) || g_ed.cull != cu) { enc_r_cull(en, (MTLCullMode)cu); g_ed.cull = cu; g_ed.ok |= ED_CULL; }
       if (!(g_ed.ok & ED_WIND) || g_ed.wind != wi) { enc_r_winding(en, (MTLWinding)wi); g_ed.wind = wi; g_ed.ok |= ED_WIND; }
       if (!(g_ed.ok & ED_FILL) || g_ed.fill != fi) { enc_r_fill(en, (MTLTriangleFillMode)fi); g_ed.fill = fi; g_ed.ok |= ED_FILL; }
